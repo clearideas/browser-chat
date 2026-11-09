@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.local
+*.local
+
+# Test files (excluded from build)
+test.html
+test-results/
+playwright-report/
+
+
+
+# Local credentials and packed releases
+.env*
+!.env.example
+*.pem
+*.key
+*.tgz

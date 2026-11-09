@@ -1,0 +1,7 @@
+# Prettier ignore patterns
+# Add specific files/patterns you want to exclude from Prettier formatting
+
+# Example: ignore generated files
+dist/
+build/
+*.min.js

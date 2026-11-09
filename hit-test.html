@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Clear Ideas Widget Hit Test</title>
+    <link rel="stylesheet" href="/dist/clearideas-widget.css" />
+    <style>
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        min-height: 100vh;
+        margin: 0;
+      }
+
+      #underlay-button {
+        position: fixed;
+        right: 25px;
+        bottom: 35px;
+        width: 56px;
+        height: 56px;
+        border: 0;
+        border-radius: 999px;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+        z-index: 1000;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="underlay-button" type="button" aria-label="Underlay Button">0</button>
+
+    <script src="/dist/clearideas-widget.iife.js"></script>
+    <script>
+      window.underlayClicks = 0
+      document.getElementById('underlay-button').addEventListener('click', event => {
+        window.underlayClicks += 1
+        event.currentTarget.textContent = String(window.underlayClicks)
+      })
+
+      window.testWidget = window.ClearIdeasWidget.init({
+        accessKey: 'widget_local_hit_test_placeholder.not-a-real-key',
+        apiBaseUrl: 'https://api.example.test',
+      })
+    </script>
+  </body>
+</html>
