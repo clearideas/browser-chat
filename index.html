@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Browser Chat – development</title>
+    <!-- Development index, served at / by `npm run dev` (http://127.0.0.1:8000/ by default). Not part of the package. -->
+    <link rel="stylesheet" href="/tests/e2e/pages/page.css" />
+    <script src="/tests/e2e/pages/dev-theme.js"></script>
+    <script src="/dev-config.js"></script>
+    <style>
+      body {
+        max-width: 820px;
+        padding-bottom: 64px;
+      }
+      h1 {
+        margin-bottom: 4px;
+      }
+      h2 {
+        margin-top: 32px;
+        font-size: 1.15rem;
+      }
+      .subtitle {
+        margin-top: 0;
+        color: var(--page-muted);
+      }
+      ul {
+        padding-left: 20px;
+      }
+      li {
+        margin: 6px 0;
+      }
+      .status {
+        list-style: none;
+        padding: 0;
+      }
+      .status li::before {
+        content: '…';
+        display: inline-block;
+        width: 1.4em;
+        font-weight: 700;
+      }
+      .status li.ok::before {
+        content: '✓';
+        color: var(--page-ok);
+      }
+      .status li.missing::before {
+        content: '✗';
+        color: var(--page-bad);
+      }
+      .languages {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 18px;
+        list-style: none;
+        padding: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Chat – development</h1>
+    <p class="subtitle">Local pages for the Clear Ideas® chat widget and its test server.</p>
+
+    <h2>Status</h2>
+    <ul class="status">
+      <li id="status-bundle">Widget bundle (<code>dist/</code>)</li>
+      <li id="status-server">Test server on <code id="api-url"></code></li>
+    </ul>
+    <p class="hint">
+      <code>npm run dev</code> keeps both up to date: it rebuilds the widget on every change and
+      runs the test server, which returns canned replies and never calls an AI service.
+    </p>
+
+    <h2>Try the widget</h2>
+    <ul>
+      <li>
+        <a href="/dev.html?key=demo-public-key">Demo site</a> – a normal configuration, with
+        controls for language, position and dark mode
+      </li>
+      <li>
+        <a href="/dev.html?key=adversarial-public-key">Adversarial site</a> – hostile configuration;
+        its markup must appear as plain text and never run
+      </li>
+      <li>
+        <a href="/dev.html?key=disabled-public-key">Disabled site</a> – chat switched off: the
+        server refuses the widget, so the launcher is hidden
+      </li>
+      <li>
+        <a href="/dev.html?key=voice-public-key">Voice site</a> – realtime voice over the test
+        server's WebSocket relay, and recorded voice (needs a microphone)
+      </li>
+      <li>
+        <a href="/dev.html?key=recorded-voice-public-key">Recorded voice site</a> – recorded voice
+        only, so the microphone records a message
+      </li>
+    </ul>
+    <p>The demo in each built-in language (the test server answers in the same language):</p>
+    <ul class="languages" id="languages">
+      <li><a href="/dev.html?lang=en" lang="en">English</a></li>
+      <li><a href="/dev.html?lang=fr" lang="fr">Français</a></li>
+      <li><a href="/dev.html?lang=es" lang="es">Español</a></li>
+      <li><a href="/dev.html?lang=de" lang="de">Deutsch</a></li>
+      <li><a href="/dev.html?lang=it" lang="it">Italiano</a></li>
+      <li><a href="/dev.html?lang=pt" lang="pt">Português</a></li>
+      <li><a href="/dev.html?lang=nl" lang="nl">Nederlands</a></li>
+      <li><a href="/dev.html?lang=pl" lang="pl">Polski</a></li>
+      <li><a href="/dev.html?lang=ja" lang="ja">日本語</a></li>
+      <li><a href="/dev.html?lang=ko" lang="ko">한국어</a></li>
+      <li><a href="/dev.html?lang=zh-Hans" lang="zh-Hans">简体中文</a></li>
+      <li><a href="/dev.html?lang=zh-Hant" lang="zh-Hant">繁體中文</a></li>
+      <li><a href="/dev.html?lang=ar" lang="ar" dir="rtl">العربية</a> (right to left)</li>
+    </ul>
+    <p class="hint">
+      In the chat, send any message to have it echoed back, or <code>/fixture help</code> for the
+      reply scenarios: Markdown, citations, errors, dropped connections, stream formats and hostile
+      content.
+    </p>
+
+    <h2>Browser test pages</h2>
+    <p class="hint">
+      Used by <code>npm run test:e2e</code>, and usable by hand: each page says what it checks and
+      what you should see.
+    </p>
+    <ul>
+      <li>
+        <a href="/tests/e2e/pages/languages.html">Languages</a> – the widget follows the page
+        language, with regional fallbacks, right-to-left layout and custom strings
+      </li>
+      <li>
+        <a href="/tests/e2e/pages/hidden-launcher.html">Hidden launcher</a> – a site that opens the
+        chat from its own button; the hidden launcher must not block clicks on the page
+      </li>
+      <li>
+        <a href="/tests/e2e/pages/isolation.html">Style isolation</a> – hostile page CSS that must
+        not change the widget
+      </li>
+      <li>
+        <a href="/tests/e2e/pages/csp.html">Strict Content-Security-Policy</a> – no inline scripts
+        or styles allowed
+      </li>
+    </ul>
+
+    <h2>Documentation</h2>
+    <ul>
+      <li><a href="/docs/protocol/README.md">Protocol specification</a> (Markdown)</li>
+      <li><a href="/docs/protocol/openapi.yaml">OpenAPI definition</a></li>
+      <li><a href="/docs/protocol/stream-events.schema.json">Stream event schema</a></li>
+      <li><a href="/server/README.md">Test server</a> – sites, access keys and fixtures</li>
+      <li><a href="/CONTRIBUTING.md">Contributing</a> – scripts and tests</li>
+    </ul>
+
+    <script>
+      function setStatus(id, ok, text) {
+        const item = document.getElementById(id)
+        item.className = ok ? 'ok' : 'missing'
+        item.append(` – ${text}`)
+      }
+
+      fetch('/dist/clearideas-widget.iife.js', { method: 'HEAD', cache: 'no-store' })
+        .then(response =>
+          setStatus(
+            'status-bundle',
+            response.ok,
+            response.ok ? 'built' : 'not built yet (run npm run dev or npm run build)',
+          ),
+        )
+        .catch(() => setStatus('status-bundle', false, 'could not check'))
+
+      document.getElementById('api-url').textContent = window.CHAT_DEV_API_URL
+      fetch(`${window.CHAT_DEV_API_URL}/healthz`, { cache: 'no-store' })
+        .then(response => response.json())
+        .then(body =>
+          setStatus('status-server', body.ok, `running (protocol v${body.protocolVersion})`),
+        )
+        .catch(() =>
+          setStatus('status-server', false, 'not running (run npm run dev or npm run server)'),
+        )
+    </script>
+  </body>
+</html>

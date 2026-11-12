@@ -1,11 +1,9 @@
 /**
- * CSS theme variables for standalone widget
+ * Legacy theme variables, kept for backward compatibility of the package export.
  *
- * This module exports the theme CSS string but does NOT auto-inject it.
- * The theme CSS is injected explicitly by the entry point (src/entry.ts)
- * to avoid unexpected side-effects when importing this module.
- *
- * @see src/utils/css.ts for the injection function
+ * The widget defines all of its variables on its own root element and no longer injects this CSS.
+ * To theme the widget, set --ci-widget-accent and --ci-widget-font-family on the page's :root
+ * (see README, "Styling"), or configure the accent color on the server (style.color).
  */
 export const themeCSS = `
 :root {

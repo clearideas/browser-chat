@@ -2,6 +2,19 @@ import { mount, type VueWrapper } from '@vue/test-utils'
 
 import ClearIdeasWidgetStandalone from '@/ClearIdeasWidgetStandalone.vue'
 import type { WidgetProps } from '@/types'
+import { storageKey, type StorageKeyName, storageNamespace } from '@/utils/storage'
+
+export const TEST_ACCESS_KEY = 'test-access-key'
+export const TEST_API_BASE_URL = 'https://api.clearideas.local'
+
+/** Storage key the widget uses for `name`, namespaced by server and site. */
+export function widgetStorageKey(
+  name: StorageKeyName,
+  apiBaseUrl: string = TEST_API_BASE_URL,
+  accessKey: string = TEST_ACCESS_KEY,
+): string {
+  return storageKey(name, storageNamespace(apiBaseUrl, accessKey))
+}
 
 /**
  * Create a wrapper for the ClearIdeasWidgetStandalone component with default props
@@ -10,8 +23,8 @@ export function createWidgetWrapper(
   props: Partial<WidgetProps> = {},
 ): VueWrapper<InstanceType<typeof ClearIdeasWidgetStandalone>> {
   const defaultProps: WidgetProps = {
-    accessKey: 'test-access-key',
-    apiBaseUrl: 'https://api.clearideas.local',
+    accessKey: TEST_ACCESS_KEY,
+    apiBaseUrl: TEST_API_BASE_URL,
     openOnLoad: false,
     position: 'bottom-right',
     width: 380,

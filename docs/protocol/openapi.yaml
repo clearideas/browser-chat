@@ -1,0 +1,823 @@
+openapi: 3.1.0
+info:
+  title: Public Chat Protocol
+  version: '1'
+  summary: HTTP contract between the browser chat widget and a chat server.
+  description: |
+    Protocol version 1. Normative rules (CORS, sessions, streaming framing, content handling,
+    security) are in README.md next to this file; this document defines endpoints and payloads.
+
+    Streaming responses are Server-Sent Events whose `data:` payloads are defined in
+    `stream-events.schema.json`.
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: https://api.example.com
+    description: Your chat server (the widget's `apiBaseUrl`)
+
+security:
+  - accessKey: []
+
+tags:
+  - name: core
+    description: Required for every server.
+  - name: non-streaming
+    description: Optional. Complete (non-streamed) replies. Not used by the widget.
+  - name: voice
+    description: Optional. Recorded voice messages. Advertised with `voiceEnabled`.
+  - name: realtime
+    description: Optional. Realtime speech-to-speech sessions. Advertised with `voiceEnabled`.
+
+paths:
+  /public/chat/init:
+    get:
+      tags: [core]
+      operationId: getInit
+      summary: Get widget configuration
+      description: |
+        Returns the site's public widget configuration and, when the request did not carry a valid
+        session ID, issues one in `x-clearideas-public-chat-session-id`. Must be called before any
+        other endpoint.
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/ConsentStatus'
+        - $ref: '#/components/parameters/SessionHeader'
+      responses:
+        '200':
+          description: Widget configuration.
+          headers:
+            x-clearideas-public-chat-session-id:
+              $ref: '#/components/headers/SessionId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InitResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /public/chat/session:
+    post:
+      tags: [core]
+      operationId: activateSession
+      summary: Activate the visitor session
+      description: |
+        Called when the widget opens. Returns the visitor's most recent chat for this site, if any.
+        The request has no body. May issue or rotate the session ID.
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/ConsentStatus'
+        - $ref: '#/components/parameters/SessionHeader'
+      responses:
+        '200':
+          description: Session activated.
+          headers:
+            x-clearideas-public-chat-session-id:
+              $ref: '#/components/headers/SessionId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionActivationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /public/chat/stream:
+    post:
+      tags: [core]
+      operationId: streamNewChat
+      summary: Start a chat and stream the reply
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/ChatMessage'
+      responses:
+        '200':
+          $ref: '#/components/responses/EventStream'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /public/chat/{chatId}/stream:
+    post:
+      tags: [core]
+      operationId: streamContinueChat
+      summary: Continue a chat and stream the reply
+      parameters:
+        - $ref: '#/components/parameters/ChatId'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/ChatMessage'
+      responses:
+        '200':
+          $ref: '#/components/responses/EventStream'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ChatNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /public/chat:
+    post:
+      tags: [non-streaming]
+      operationId: sendNewChat
+      summary: Start a chat and return the complete reply
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/ChatMessage'
+      responses:
+        '200':
+          description: |
+            Complete reply. For a new chat, `messages` contains the greeting followed by the
+            assistant reply (the visitor's message is not included; see README §11).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /public/chat/{chatId}:
+    post:
+      tags: [non-streaming]
+      operationId: sendContinueChat
+      summary: Continue a chat and return the complete reply
+      parameters:
+        - $ref: '#/components/parameters/ChatId'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/ChatMessage'
+      responses:
+        '200':
+          description: Complete reply. `messages` contains only the new assistant message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ChatNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /public/chat/voice/stream:
+    post:
+      tags: [voice]
+      operationId: streamNewVoiceChat
+      summary: Start a chat with recorded audio and stream transcript, reply and audio
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/VoiceMessage'
+      responses:
+        '200':
+          $ref: '#/components/responses/EventStream'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /public/chat/voice/{chatId}/stream:
+    post:
+      tags: [voice]
+      operationId: streamContinueVoiceChat
+      summary: Continue a chat with recorded audio and stream transcript, reply and audio
+      parameters:
+        - $ref: '#/components/parameters/ChatId'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/VoiceMessage'
+      responses:
+        '200':
+          $ref: '#/components/responses/EventStream'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ChatNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /public/chat/voice:
+    post:
+      tags: [voice]
+      operationId: sendNewVoiceChat
+      summary: Start a chat with recorded audio and return the complete reply
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/VoiceMessage'
+      responses:
+        '200':
+          description: Transcript, reply text and reply audio.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /public/chat/voice/{chatId}:
+    post:
+      tags: [voice]
+      operationId: sendContinueVoiceChat
+      summary: Continue a chat with recorded audio and return the complete reply
+      parameters:
+        - $ref: '#/components/parameters/ChatId'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        $ref: '#/components/requestBodies/VoiceMessage'
+      responses:
+        '200':
+          description: Transcript, reply text and reply audio.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoiceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ChatNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /public/chat/realtime/session:
+    post:
+      tags: [realtime]
+      operationId: createRealtimeSession
+      summary: Create a realtime speech-to-speech session
+      description: See README §12.1 for the media and event channel that follows.
+      parameters:
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/SessionHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RealtimeSessionRequest'
+      responses:
+        '200':
+          description: Realtime session details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RealtimeSessionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+components:
+  securitySchemes:
+    accessKey:
+      type: http
+      scheme: bearer
+      description: |
+        Public site access key. Embedded in web pages and visible to visitors; it identifies the
+        site and grants only this public API. Never an AI provider key.
+
+  parameters:
+    ChatId:
+      name: chatId
+      in: path
+      required: true
+      description: Opaque chat ID issued by the server. Must belong to this site and visitor.
+      schema:
+        type: string
+        minLength: 1
+    AcceptLanguage:
+      name: Accept-Language
+      in: header
+      required: false
+      description: >-
+        The widget's language as one BCP 47 tag. Servers may localize visitor-facing text
+        (README §3.4).
+      schema:
+        type: string
+        examples: [en, fr, pt, zh-Hant, ar]
+    UserId:
+      name: x-clearideas-public-chat-user-id
+      in: header
+      required: false
+      description: >-
+        The site's ID for the signed-in user, percent-encoded UTF-8, at most 256 characters before
+        encoding. Unverified: never grant access based on it. Chats are scoped to it (README §5.5).
+      schema:
+        type: string
+        examples: [user-42, zo%C3%AB%40example.com]
+    ConsentStatus:
+      name: x-clearideas-public-chat-consent-status
+      in: header
+      required: false
+      description: |
+        Host page consent state. With `pending`, the server must not set persistent cookies.
+        Missing is treated as `not-required`.
+      schema:
+        type: string
+        enum: [granted, not-required, pending]
+    SessionHeader:
+      name: x-clearideas-public-chat-session
+      in: header
+      required: false
+      description: Session ID previously returned in `x-clearideas-public-chat-session-id`.
+      schema:
+        type: string
+
+  headers:
+    SessionId:
+      description: |
+        Session ID to store and send back in `x-clearideas-public-chat-session`. Must be exposed
+        through `Access-Control-Expose-Headers`.
+      schema:
+        type: string
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 0
+    RateLimitLimit:
+      description: Requests allowed in the current window.
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: Requests remaining in the current window.
+      schema:
+        type: integer
+    RateLimitReset:
+      description: Seconds until the window resets.
+      schema:
+        type: integer
+
+  requestBodies:
+    ChatMessage:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ChatRequest'
+    VoiceMessage:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/VoiceRequest'
+
+  responses:
+    EventStream:
+      description: |
+        Server-Sent Events. Servers should send each event as one `data: <json>` line followed by a
+        blank line; clients parse any valid SSE framing (README §6.1). Payloads are defined in
+        `stream-events.schema.json`.
+      content:
+        text/event-stream:
+          schema:
+            type: string
+          x-event-schema:
+            $ref: './stream-events.schema.json'
+    BadRequest:
+      description: Invalid JSON or validation failure.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid access key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Site disabled, origin not allowed, or optional profile not enabled.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ChatNotFound:
+      description: Chat does not exist or does not belong to this site and visitor.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Request body too large.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Rate limited.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServerError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UpstreamError:
+      description: The AI provider failed or is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      description: Error body. `message` is shown to the visitor and must not contain secrets.
+      required: [message]
+      properties:
+        message:
+          type: string
+        details: {}
+
+    InitResponse:
+      type: object
+      required: [initialMessage, chatName]
+      properties:
+        protocolVersion:
+          type: integer
+          minimum: 1
+          description: Protocol version implemented by the server. Missing means 1.
+        initialMessage:
+          type: string
+          description: Greeting shown at the start of a new chat (Markdown, variables already filled in).
+        chatName:
+          type: string
+          description: Assistant display name.
+        chatTagline:
+          type: string
+        heroGreeting:
+          type: string
+          description: Headline on the widget home view.
+        iconUrl:
+          type: string
+          format: uri
+          description: Absolute http(s) URL of the site icon.
+        style:
+          $ref: '#/components/schemas/Style'
+        links:
+          type: array
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/Link'
+        voiceEnabled:
+          type: boolean
+          description: Advertises the voice profiles.
+        voice:
+          type: object
+          description: Legacy form of `voiceEnabled`. Clients accept either.
+          properties:
+            enabled:
+              type: boolean
+        helloBubbleEnabled:
+          type: boolean
+          description: Show a greeting bubble next to the launcher button once per visitor.
+        helloBubbleText:
+          type: string
+        helloBubbleDelay:
+          type: number
+          minimum: 0
+          description: Seconds before the bubble appears (default 5).
+        disclaimerText:
+          type: string
+          description: Short notice shown above the conversation.
+        disclaimerDialogEnabled:
+          type: boolean
+          description: Show a dialog the visitor must scroll through and accept before chatting.
+        disclaimerDialogText:
+          type: string
+        existingChat:
+          $ref: '#/components/schemas/ExistingChat'
+          deprecated: true
+          description: Sent by some servers. Version 1 clients ignore it and use `POST /public/chat/session`.
+
+    Style:
+      type: object
+      properties:
+        color:
+          type: string
+          description: Accent color, `#rgb`, `#rrggbb` or `rgb(r, g, b)`.
+          examples: ['#2866cf']
+        mode:
+          type: string
+          enum: [light, dark, system]
+          default: system
+          description: >-
+            Widget theme. `system` follows the host page's theme markup (for example
+            `class="dark"` or `data-theme="dark"` on `<html>`) and otherwise the visitor's system
+            preference. A page can still override it with the widget's `darkMode` option.
+
+    Link:
+      type: object
+      required: [title, url]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        url:
+          type: string
+          format: uri
+          description: Absolute http(s) URL.
+
+    SessionActivationResponse:
+      type: object
+      properties:
+        existingChat:
+          $ref: '#/components/schemas/ExistingChat'
+
+    ExistingChat:
+      type: object
+      required: [chatId, messages]
+      properties:
+        chatId:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoredMessage'
+
+    StoredMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+          description: Markdown (untrusted, see README §7).
+        createdAt:
+          type: string
+          format: date-time
+
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: object
+          required: [content]
+          properties:
+            content:
+              type: string
+              minLength: 1
+              description: Visitor message. Servers enforce a maximum length.
+            aiModel:
+              type: [string, 'null']
+              description: Optional model hint. Servers must ignore it or check it against an allowlist.
+
+    ChatResponse:
+      type: object
+      required: [chatId, messages]
+      properties:
+        chatId:
+          type: string
+        chatName:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoredMessage'
+
+    VoiceRequest:
+      type: object
+      required: [audio]
+      properties:
+        audio:
+          type: string
+          contentEncoding: base64
+          description: Recorded audio.
+        format:
+          type: string
+          enum: [webm, mp3, wav, m4a, ogg]
+          default: webm
+        chatId:
+          type: string
+          description: Continue this chat (non-path variant of the voice endpoints).
+
+    VoiceResponse:
+      type: object
+      required: [chatId, transcript, response, audio]
+      properties:
+        chatId:
+          type: string
+        chatName:
+          type: string
+        transcript:
+          type: string
+          description: Recognized visitor speech.
+        response:
+          type: string
+          description: Assistant reply (Markdown).
+        audio:
+          type: string
+          contentEncoding: base64
+          description: Reply audio, WebM/Opus.
+
+    RealtimeSessionRequest:
+      type: object
+      required: [locale]
+      properties:
+        sdp:
+          type: string
+          description: WebRTC SDP offer, when the browser supports WebRTC.
+        chatId:
+          type: string
+        locale:
+          type: string
+
+    RealtimeSessionResponse:
+      oneOf:
+        - $ref: '#/components/schemas/RealtimeWebRtcSession'
+        - $ref: '#/components/schemas/RealtimeWebSocketSession'
+      discriminator:
+        propertyName: transport
+        mapping:
+          webrtc: '#/components/schemas/RealtimeWebRtcSession'
+          websocket: '#/components/schemas/RealtimeWebSocketSession'
+
+    RealtimeWebRtcSession:
+      type: object
+      required: [provider, transport, realtimeSessionId, sdp]
+      properties:
+        provider:
+          type: string
+          const: openai
+        transport:
+          type: string
+          const: webrtc
+        realtimeSessionId:
+          type: string
+        sdp:
+          type: string
+          description: SDP answer.
+        chatId:
+          type: string
+        initialGreeting:
+          type: string
+
+    RealtimeWebSocketSession:
+      type: object
+      required: [provider, transport, realtimeSessionId, websocketPath, websocketProtocol]
+      properties:
+        provider:
+          type: string
+          const: xai
+        transport:
+          type: string
+          const: websocket
+        realtimeSessionId:
+          type: string
+        websocketPath:
+          type: string
+          description: Path appended to the API base URL (with `http` replaced by `ws`).
+        websocketProtocol:
+          type: string
+          description: WebSocket subprotocol to request.
+        sampleRate:
+          type: integer
+          default: 24000
+        chatId:
+          type: string
+        initialGreeting:
+          type: string

@@ -1,106 +1,145 @@
-import { computed, ref } from 'vue'
+import { computed, type ComputedRef, inject, type InjectionKey, provide, ref } from 'vue'
 
-import { type WidgetLocale, widgetMessages } from './messages'
+import { builtInLocales } from './locales'
+import { FALLBACK_LOCALE, localeDirection, resolveLocale } from './resolve'
+import type { WidgetMessageOverrides, WidgetMessages, WidgetMessagesOption } from './types'
 
-const FALLBACK_LOCALE: WidgetLocale = 'en'
+/**
+ * The languages the page asks for: `<html lang>`, or the browser's languages when the page does
+ * not declare one. Page state, shared by all widgets and observed while at least one is mounted.
+ */
+function readDocumentLanguages(): string[] {
+  if (typeof document === 'undefined') return []
+  const lang = document.documentElement.lang.trim()
+  if (lang) return [lang]
+  if (typeof navigator === 'undefined') return []
+  if (navigator.languages?.length) return [...navigator.languages]
+  return navigator.language ? [navigator.language] : []
+}
+
+const documentLanguages = ref<string[]>(readDocumentLanguages())
 let localeObserver: MutationObserver | null = null
 let activeLocaleConsumers = 0
 
-export function resolveWidgetLocale(value?: string | null): WidgetLocale {
-  if (!value) return FALLBACK_LOCALE
-
-  const normalized = value.toLowerCase()
-  if (normalized === 'fr' || normalized.startsWith('fr-')) return 'fr'
-
-  return 'en'
-}
-
-export function getDocumentLocale(): WidgetLocale {
-  if (typeof document === 'undefined') return FALLBACK_LOCALE
-
-  return resolveWidgetLocale(document.documentElement.lang)
-}
-
-const documentLocale = ref<WidgetLocale>(getDocumentLocale())
-const explicitLocale = ref<WidgetLocale | null>(null)
-const currentLocale = computed<WidgetLocale>(() => explicitLocale.value ?? documentLocale.value)
-
-export function setWidgetLocale(value?: string | null) {
-  explicitLocale.value = value == null ? null : resolveWidgetLocale(value)
-  updateWidgetLocaleDebug('setWidgetLocale', value)
-}
-
 export function startWidgetLocaleTracking() {
   if (typeof document === 'undefined') return
-
   activeLocaleConsumers += 1
-
   if (!localeObserver) {
-    localeObserver = new MutationObserver(() => {
-      syncDocumentLocale('document-lang-changed')
-    })
-
+    localeObserver = new MutationObserver(syncDocumentLanguages)
     localeObserver.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ['lang'],
     })
   }
-
-  syncDocumentLocale('runtime-start')
+  syncDocumentLanguages()
 }
 
 export function stopWidgetLocaleTracking() {
-  if (activeLocaleConsumers > 0) {
-    activeLocaleConsumers -= 1
-  }
-
+  if (activeLocaleConsumers > 0) activeLocaleConsumers -= 1
   if (activeLocaleConsumers === 0 && localeObserver) {
     localeObserver.disconnect()
     localeObserver = null
   }
 }
 
-export function useWidgetI18n() {
-  function t(key: string, params?: Record<string, string | number>): string {
-    const dictionary = widgetMessages[currentLocale.value] ?? widgetMessages[FALLBACK_LOCALE]
-    const fallbackDictionary = widgetMessages[FALLBACK_LOCALE]
-    const raw = getNestedValue(dictionary, key) ?? getNestedValue(fallbackDictionary, key) ?? key
+function syncDocumentLanguages() {
+  const next = readDocumentLanguages()
+  if (next.join() !== documentLanguages.value.join()) documentLanguages.value = next
+}
 
-    if (!params) return raw
+export interface WidgetI18n {
+  /**
+   * The widget's locale, a key of the built-in or custom locales (for example `fr` or `zh-Hant`):
+   * the best match for the locale set for this widget, otherwise for the page language.
+   */
+  locale: ComputedRef<string>
+  /** Text direction of the locale. */
+  dir: ComputedRef<'ltr' | 'rtl'>
+  t: (key: string, params?: Record<string, string | number>) => string
+  /** Sets this widget's locale (any BCP 47 tag); null or undefined follows the page again. */
+  setLocale: (value?: string | null) => void
+  /** Sets this widget's custom messages (see WidgetMessagesOption). */
+  setMessages: (messages?: WidgetMessagesOption | null) => void
+}
 
-    return raw.replace(/\{(\w+)\}/g, (_, token) => String(params[token] ?? `{${token}}`))
-  }
+/** Creates the locale state of one widget instance. */
+export function createWidgetI18n(): WidgetI18n {
+  const requestedLocale = ref<string | null>(null)
+  const customMessages = ref<WidgetMessagesOption>({})
+
+  const available = computed(() => [
+    ...new Set([...Object.keys(builtInLocales), ...Object.keys(customMessages.value)]),
+  ])
+  const locale = computed(() =>
+    resolveLocale(requestedLocale.value ?? documentLanguages.value, available.value),
+  )
+  const dir = computed(() => localeDirection(locale.value))
+
+  /** Dictionaries to look a key up in, in order. */
+  const chain = computed(() => {
+    const custom = customMessages.value
+    const language = locale.value.split('-')[0]
+    const dictionaries: (WidgetMessages | WidgetMessageOverrides | undefined)[] = [
+      custom[locale.value],
+      builtInLocales[locale.value],
+    ]
+    // A custom regional locale such as `fr-CA` falls back to the built-in language first.
+    if (language !== locale.value) dictionaries.push(custom[language], builtInLocales[language])
+    dictionaries.push(custom[FALLBACK_LOCALE], builtInLocales[FALLBACK_LOCALE])
+    return dictionaries.filter(Boolean) as (WidgetMessages | WidgetMessageOverrides)[]
+  })
 
   return {
-    locale: currentLocale,
-    t,
-    setLocale: setWidgetLocale,
+    locale,
+    dir,
+    t: (key, params) => translate(chain.value, key, params, dir.value === 'rtl'),
+    setLocale(value) {
+      requestedLocale.value = value?.trim() ? value : null
+    },
+    setMessages(messages) {
+      customMessages.value = messages && typeof messages === 'object' ? messages : {}
+    },
   }
 }
 
-function syncDocumentLocale(reason: string) {
-  documentLocale.value = getDocumentLocale()
-  updateWidgetLocaleDebug(reason)
+const I18N_KEY: InjectionKey<WidgetI18n> = Symbol('clearideas-widget-i18n')
+let standaloneI18n: WidgetI18n | null = null
+
+/** Called by the widget root: gives the widget and its child components their own locale. */
+export function provideWidgetI18n(): WidgetI18n {
+  const i18n = createWidgetI18n()
+  provide(I18N_KEY, i18n)
+  return i18n
 }
 
-function updateWidgetLocaleDebug(reason: string, requestedLocale?: string | null) {
-  if (typeof window === 'undefined') return
-  ;(window as any).__ClearIdeasWidgetLocaleDebug = {
-    reason,
-    requestedLocale: requestedLocale ?? null,
-    documentLang: typeof document === 'undefined' ? null : document.documentElement.lang,
-    documentLocale: documentLocale.value,
-    explicitLocale: explicitLocale.value,
-    currentLocale: currentLocale.value,
-    timestamp: new Date().toISOString(),
+/** Locale of the enclosing widget (components rendered on their own share a default). */
+export function useWidgetI18n(): WidgetI18n {
+  return inject(I18N_KEY, null) ?? (standaloneI18n ??= createWidgetI18n())
+}
+
+/**
+ * Looks a key up and fills in `{name}` placeholders. In right-to-left text, values are wrapped in
+ * Unicode isolates (U+2068…U+2069) so a left-to-right name cannot reorder the sentence around it.
+ */
+function translate(
+  dictionaries: readonly (WidgetMessages | WidgetMessageOverrides)[],
+  key: string,
+  params: Record<string, string | number> | undefined,
+  isolate: boolean,
+): string {
+  const [section, name] = key.split('.')
+  let raw = key
+  for (const dictionary of dictionaries) {
+    const value = (dictionary as Record<string, Record<string, unknown> | undefined>)[section]?.[
+      name
+    ]
+    if (typeof value === 'string') {
+      raw = value
+      break
+    }
   }
-}
-
-function getNestedValue(value: Record<string, unknown>, key: string): string | undefined {
-  const result = key.split('.').reduce<unknown>((acc, segment) => {
-    if (!acc || typeof acc !== 'object') return undefined
-    return (acc as Record<string, unknown>)[segment]
-  }, value)
-
-  return typeof result === 'string' ? result : undefined
+  if (!params) return raw
+  return raw.replace(/\{(\w+)\}/g, (match, token) =>
+    token in params ? (isolate ? `\u2068${params[token]}\u2069` : String(params[token])) : match,
+  )
 }

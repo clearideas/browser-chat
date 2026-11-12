@@ -46,6 +46,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -102,6 +104,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -150,6 +154,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -194,6 +200,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -245,6 +253,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -260,6 +270,53 @@ describe('autoInitializeFromDataAttributes', () => {
     const config = (initFn as MockedFunction<(config: WidgetConfig) => WidgetInstance>).mock
       .calls[0][0]
     expect(config.darkMode).toBe(true)
+  })
+
+  it('passes the signed-in user from data attributes', () => {
+    const initFn = vi.fn((_config: WidgetConfig) => ({
+      open: vi.fn(),
+      close: vi.fn(),
+      toggle: vi.fn(),
+      sendMessage: vi.fn(),
+      hide: vi.fn(),
+      show: vi.fn(),
+      openChatDirectly: vi.fn(),
+      setDarkMode: vi.fn(),
+      setConsentRequired: vi.fn(),
+      setConsentGranted: vi.fn(),
+      setPosition: vi.fn(),
+      setWidth: vi.fn(),
+      setHeight: vi.fn(),
+      setTop: vi.fn(),
+      setRight: vi.fn(),
+      setBottom: vi.fn(),
+      setLeft: vi.fn(),
+      setFabSize: vi.fn(),
+      setActions: vi.fn(),
+      setUserName: vi.fn(),
+      setUserEmail: vi.fn(),
+      setUserId: vi.fn(),
+      setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
+      destroy: vi.fn(),
+    })) as (config: WidgetConfig) => WidgetInstance
+
+    const element = document.createElement('div')
+    element.setAttribute('data-clearideas-widget', '')
+    element.setAttribute('data-access-key', 'test-key')
+    element.setAttribute('data-user-id', 'user-42')
+    element.setAttribute('data-user-name', 'Ada')
+    document.body.appendChild(element)
+
+    autoInitializeFromDataAttributes(initFn)
+    document.dispatchEvent(new Event('DOMContentLoaded'))
+
+    const config = (initFn as MockedFunction<(config: WidgetConfig) => WidgetInstance>).mock
+      .calls[0][0]
+    expect(config.userId).toBe('user-42')
+    expect(config.userName).toBe('Ada')
+    expect(config.userEmail).toBeUndefined()
   })
 
   it('handles fabSize and fabHide attributes', () => {
@@ -287,6 +344,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -345,6 +404,8 @@ describe('autoInitializeFromDataAttributes', () => {
       setUserEmail: vi.fn(),
       setUserId: vi.fn(),
       setLocale: vi.fn(),
+      setMessages: vi.fn(),
+      stopReply: vi.fn(),
       destroy: vi.fn(),
     })) as (config: WidgetConfig) => WidgetInstance
 
@@ -362,5 +423,85 @@ describe('autoInitializeFromDataAttributes', () => {
     document.dispatchEvent(new Event('DOMContentLoaded'))
 
     expect(initFn).toHaveBeenCalledTimes(2)
+  })
+  describe('elements added or removed after the page loaded', () => {
+    const flush = () => new Promise(resolve => setTimeout(resolve, 0)) // mutation observers
+    const widgetElement = (key: string) => {
+      const element = document.createElement('div')
+      element.setAttribute('data-clearideas-widget', '')
+      element.setAttribute('data-access-key', key)
+      return element
+    }
+    const mockInit = () =>
+      vi.fn((_config: WidgetConfig) => ({ destroy: vi.fn() }) as unknown as WidgetInstance)
+
+    it('initializes elements added later, directly or inside an added subtree', async () => {
+      const initFn = mockInit()
+      const stop = autoInitializeFromDataAttributes(initFn)
+      await flush()
+      expect(initFn).not.toHaveBeenCalled()
+
+      document.body.appendChild(widgetElement('direct'))
+      const wrapper = document.createElement('section')
+      wrapper.appendChild(widgetElement('nested'))
+      document.body.appendChild(wrapper)
+      await flush()
+
+      expect(initFn.mock.calls.map(call => call[0].accessKey)).toEqual(['direct', 'nested'])
+      stop()
+    })
+
+    it('destroys the widget when its element is removed', async () => {
+      const initFn = mockInit()
+      const element = widgetElement('key')
+      const wrapper = document.createElement('main')
+      wrapper.appendChild(element)
+      document.body.appendChild(wrapper)
+      const stop = autoInitializeFromDataAttributes(initFn)
+      await flush()
+      const instance = initFn.mock.results[0].value as WidgetInstance
+
+      wrapper.remove() // for example a single-page-app route change
+      await flush()
+      expect(instance.destroy).toHaveBeenCalledTimes(1)
+      stop()
+    })
+
+    it('stops waiting for consent when the element is removed', async () => {
+      vi.useFakeTimers()
+      const initFn = mockInit()
+      ;(window as any).laterConsent = false
+      const element = widgetElement('key')
+      element.setAttribute('data-has-consent', 'laterConsent')
+      document.body.appendChild(element)
+      const stop = autoInitializeFromDataAttributes(initFn)
+      await vi.advanceTimersByTimeAsync(0)
+
+      element.remove()
+      await vi.advanceTimersByTimeAsync(0)
+      ;(window as any).laterConsent = true
+      await vi.advanceTimersByTimeAsync(2000)
+      document.dispatchEvent(new Event('clearideas-consent-granted-key'))
+
+      expect(initFn).not.toHaveBeenCalled()
+      stop()
+      vi.useRealTimers()
+      delete (window as any).laterConsent
+    })
+
+    it('initializes each element once, even if called again', async () => {
+      document.body.appendChild(widgetElement('once'))
+      const first = mockInit()
+      autoInitializeFromDataAttributes(first)
+      const second = mockInit()
+      const stop = autoInitializeFromDataAttributes(second) // replaces the first
+      await flush()
+      document.body.appendChild(widgetElement('later'))
+      await flush()
+
+      expect(first).not.toHaveBeenCalled()
+      expect(second.mock.calls.map(call => call[0].accessKey)).toEqual(['once', 'later'])
+      stop()
+    })
   })
 })

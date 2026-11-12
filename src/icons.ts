@@ -18,8 +18,15 @@ export const icons = {
   chevronLeft: `<path d="M153.5 320L164.8 308.7L372.8 100.7L384.1 89.4L406.7 112L395.4 123.3L198.7 320L395.4 516.7L406.7 528L384.1 550.6L372.8 539.3L164.8 331.3L153.5 320z"/>`,
 }
 
-export function getIcon(name: string, size: number = 16): string {
-  const icon = icons[name as keyof typeof icons]
-  if (!icon) return ''
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" width="${size}" height="${size}" fill="currentColor">${icon}</svg>`
+export type IconName = keyof typeof icons
+
+/**
+ * An icon as SVG markup for v-html. Icons are decorative (controls carry their own labels), so they
+ * are hidden from assistive technology.
+ */
+export function getIconSVG(iconName: IconName, size: number = 16): string {
+  const iconPath = icons[iconName]
+  if (!iconPath) return ''
+  const viewBox = iconName === 'ciIcon' ? '0 0 512 512' : '0 0 640 640'
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${size}" height="${size}" fill="currentColor" aria-hidden="true" focusable="false">${iconPath}</svg>`
 }

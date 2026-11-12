@@ -1,5 +1,6 @@
 import { computed, getCurrentInstance, onUnmounted, type Ref, ref } from 'vue'
 
+import { ServerMessageError, type VoiceErrorKind } from '../utils/errors'
 import type { RealtimeTranscriptIdentity } from '../utils/realtimeTranscript'
 
 const DEFAULT_WAVEFORM_BARS = 25
@@ -39,12 +40,15 @@ export interface RealtimeVoiceOptions {
   publicSessionId: Ref<string | null>
   locale: Ref<string>
   includeCredentials: Ref<boolean>
+  /** Extra request headers, such as the signed-in user's ID. */
+  extraHeaders?: () => Record<string, string>
   waveformBars?: Ref<number>
   onChatId?: (chatId: string) => void
   onUserTranscript?: (transcript: string, identity: RealtimeTranscriptIdentity) => void
   onAssistantTranscriptDelta?: (delta: string, identity: RealtimeTranscriptIdentity) => void
   onAssistantTranscriptDone?: (transcript: string, identity: RealtimeTranscriptIdentity) => void
-  onError?: (message: string) => void
+  /** A failure during the session; `detail` is technical, for the console. */
+  onError?: (kind: VoiceErrorKind, detail: string) => void
 }
 
 /**
@@ -81,6 +85,11 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
   let greetingResponseId: string | null = null
   let nextPlaybackTime = 0
   const playbackSources = new Set<AudioBufferSourceNode>()
+  // Each connect() is an attempt; disconnect() or a newer connect() supersedes it. After every await
+  // an attempt checks it is still current, so ending a call while the microphone prompt or the
+  // session request is pending never leaves the microphone on or the call running.
+  let attempt = 0
+  let sessionRequest: AbortController | null = null
 
   const supportsRealtimeVoice = computed(
     () =>
@@ -186,9 +195,15 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
     if (audioContext.state === 'suspended') {
       void audioContext.resume().catch(() => undefined)
     }
-    const binary = atob(base64)
-    const bytes = new Uint8Array(binary.length)
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+    let binary: string
+    try {
+      binary = atob(base64)
+    } catch {
+      return // invalid base64 from the relay; skip the chunk
+    }
+    // PCM16 needs an even number of bytes; drop a trailing odd byte.
+    const bytes = new Uint8Array(binary.length - (binary.length % 2))
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = binary.charCodeAt(index)
     const samples = new Int16Array(bytes.buffer)
     const buffer = audioContext.createBuffer(1, samples.length, sampleRate)
     const channel = buffer.getChannelData(0)
@@ -287,7 +302,7 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
         if (event.chatId) options.onChatId?.(event.chatId)
         break
       case 'error':
-        options.onError?.(event.error?.message || event.message || 'Realtime voice error')
+        options.onError?.('unavailable', event.error?.message || event.message || 'error event')
         break
     }
   }
@@ -385,7 +400,7 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
     processorNode.connect(audioContext.destination)
   }
 
-  async function connectXai(session: WebSocketRealtimeVoiceSession) {
+  async function connectXai(session: WebSocketRealtimeVoiceSession, isCurrent: () => boolean) {
     peerConnection?.close()
     peerConnection = null
     eventChannel?.close()
@@ -404,12 +419,17 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
     providerSocket.addEventListener('message', event => {
       if (typeof event.data === 'string') handleRealtimeEventData(event.data)
     })
+    const socket = providerSocket
     await new Promise<void>((resolve, reject) => {
       const timeout = window.setTimeout(
         () => reject(new Error('Timed out connecting voice relay')),
         8000,
       )
-      providerSocket?.addEventListener(
+      const fail = () => {
+        window.clearTimeout(timeout)
+        reject(new Error('Could not connect voice relay'))
+      }
+      socket.addEventListener(
         'open',
         () => {
           window.clearTimeout(timeout)
@@ -417,16 +437,12 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
         },
         { once: true },
       )
-      providerSocket?.addEventListener(
-        'error',
-        () => {
-          window.clearTimeout(timeout)
-          reject(new Error('Could not connect voice relay'))
-        },
-        { once: true },
-      )
+      socket.addEventListener('error', fail, { once: true })
+      // Closed before opening (for example ended by the visitor): settle instead of waiting.
+      socket.addEventListener('close', fail, { once: true })
     })
-    providerSocket.addEventListener('close', () => {
+    if (!isCurrent() || providerSocket !== socket) return
+    socket.addEventListener('close', () => {
       if (connectionState.value === 'connected') connectionState.value = 'closed'
     })
     beginXaiMicrophone(microphoneStream!, session.sampleRate || XAI_SAMPLE_RATE)
@@ -440,6 +456,8 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
       throw new Error('Realtime voice configuration is missing')
     }
 
+    const current = ++attempt
+    const isCurrent = () => current === attempt
     cleanup('idle')
     connectionState.value = 'connecting'
 
@@ -448,9 +466,15 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
       // available. xAI audio arrives later over WebSocket and reuses it.
       const context = ensureAudioContext()
       if (context?.state === 'suspended') void context.resume().catch(() => undefined)
-      microphoneStream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       })
+      if (!isCurrent()) {
+        // Ended while the permission prompt was open: release the microphone we were just given.
+        stream.getTracks().forEach(track => track.stop())
+        return
+      }
+      microphoneStream = stream
       isMuted.value = false
 
       let offerSdp: string | undefined
@@ -472,7 +496,7 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
           if (peerConnection.connectionState === 'connected') connectionState.value = 'connected'
           else if (peerConnection.connectionState === 'failed') {
             connectionState.value = 'failed'
-            options.onError?.('Realtime voice connection failed')
+            options.onError?.('unavailable', 'peer connection failed')
           } else if (peerConnection.connectionState === 'disconnected') {
             connectionState.value = 'reconnecting'
           } else if (peerConnection.connectionState === 'closed') connectionState.value = 'closed'
@@ -481,8 +505,11 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
         eventChannel.addEventListener('message', handleDataChannelEvent)
         eventChannel.addEventListener('open', sendPendingOpenAIGreeting)
         const offer = await peerConnection.createOffer()
+        if (!isCurrent()) return
         await peerConnection.setLocalDescription(offer)
+        if (!isCurrent()) return
         await waitForIceGathering(peerConnection)
+        if (!isCurrent() || !peerConnection) return
         offerSdp = peerConnection.localDescription?.sdp || offer.sdp
       }
 
@@ -490,11 +517,14 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
         Authorization: `Bearer ${options.accessKey.value}`,
         'Content-Type': 'application/json',
         'Accept-Language': options.locale.value,
+        ...options.extraHeaders?.(),
       })
       if (options.publicSessionId.value) {
         headers.set('x-clearideas-public-chat-session', options.publicSessionId.value)
       }
+      sessionRequest = new AbortController()
       const response = await fetch(`${options.apiUrl.value}/public/chat/realtime/session`, {
+        signal: sessionRequest.signal,
         method: 'POST',
         headers,
         credentials: options.includeCredentials.value ? 'include' : 'omit',
@@ -506,10 +536,16 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
       })
       if (!response.ok) {
         const details = await response.json().catch(() => null)
-        throw new Error(details?.message || `Realtime voice is unavailable (${response.status})`)
+        if (typeof details?.message === 'string' && details.message) {
+          throw new ServerMessageError(details.message, response.status)
+        }
+        throw Object.assign(new Error(`Realtime voice is unavailable (${response.status})`), {
+          status: response.status,
+        })
       }
 
       const session = (await response.json()) as RealtimeVoiceSessionResponse
+      if (!isCurrent()) return
       if (!session.realtimeSessionId || !session.transport) {
         throw new Error('Realtime voice returned an invalid session')
       }
@@ -521,13 +557,15 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
           throw new Error('Realtime voice returned an invalid WebSocket session')
         }
         if (session.initialGreeting?.trim()) beginGreetingTranscriptSuppression()
-        await connectXai(session)
+        await connectXai(session, isCurrent)
+        if (!isCurrent()) return
       } else {
         if (!peerConnection || !session.sdp) {
           throw new Error('This browser cannot use the configured WebRTC voice provider')
         }
         pendingOpenAIGreeting = session.initialGreeting?.trim() || null
         await peerConnection.setRemoteDescription({ type: 'answer', sdp: session.sdp })
+        if (!isCurrent()) return
         sendPendingOpenAIGreeting()
         beginAnalyser(microphoneStream)
       }
@@ -538,12 +576,16 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
         recordingDuration.value += 1
       }, 1000)
     } catch (error) {
+      // A superseded attempt fails quietly and must not clean up the current one.
+      if (!isCurrent()) return
       cleanup('failed')
       throw error
     }
   }
 
   function cleanup(finalState: RealtimeVoiceConnectionState = 'closed') {
+    sessionRequest?.abort()
+    sessionRequest = null
     isListening.value = false
     isResponding.value = false
     isMuted.value = false
@@ -591,6 +633,7 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions) {
   }
 
   function disconnect() {
+    attempt += 1 // supersede any connect() still in progress
     cleanup('closed')
   }
 

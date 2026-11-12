@@ -1,20 +1,80 @@
 import { createApp } from 'vue'
 
 import ClearIdeasWidgetStandalone from './ClearIdeasWidgetStandalone.vue'
-import { themeCSS } from './theme'
-import type { WidgetAction, WidgetConfig, WidgetInstance } from './types'
+import { BUILT_IN_LOCALES } from './i18n/locales'
+import type { WidgetConfig, WidgetInstance } from './types'
 import { autoInitializeFromDataAttributes } from './utils/auto-init'
-import { injectThemeCSS } from './utils/css'
+import { applyStyles, getBundledCss, HOST_CSS } from './utils/styles'
 
-// Singleton widget instance (only one widget per page)
-let widgetInstance: WidgetInstance | null = null
-let appInstance: ReturnType<typeof createApp> | null = null
-let containerElement: HTMLElement | null = null
+const DEFAULT_CONTAINER_ID = 'clearideas-widget-container'
 
-// Inject theme CSS into document head (side-effect on module load)
-// This ensures the theme is available before any widget initialization.
-// The injection is idempotent - subsequent calls are no-ops if already injected.
-injectThemeCSS(themeCSS)
+/**
+ * Live widgets by container. Each init() creates an independent widget that owns its Vue app,
+ * shadow host and listeners. Calling init() again for the same container (or again without a
+ * container) replaces that widget, so re-initializing after login or consent keeps working;
+ * widgets in different containers coexist.
+ */
+const widgetsByContainer = new Map<HTMLElement | 'default', WidgetInstance>()
+
+/** WidgetInstance methods and the component methods they call. */
+const COMPONENT_METHODS = {
+  open: 'openWidget',
+  close: 'closeWidget',
+  toggle: 'toggleWidget',
+  sendMessage: 'sendPublicChatMessage',
+  stopReply: 'stopReply',
+  hide: 'hideFab',
+  show: 'showFab',
+  openChatDirectly: 'openChatDirectly',
+  setDarkMode: 'setDarkMode',
+  setConsentRequired: 'setConsentRequired',
+  setConsentGranted: 'setConsentGranted',
+  setPosition: 'setPosition',
+  setWidth: 'setWidth',
+  setHeight: 'setHeight',
+  setTop: 'setTop',
+  setRight: 'setRight',
+  setBottom: 'setBottom',
+  setLeft: 'setLeft',
+  setFabSize: 'setFabSize',
+  setActions: 'setActions',
+  setUserName: 'setUserName',
+  setUserEmail: 'setUserEmail',
+  setUserId: 'setUserId',
+  setLocale: 'setLocale',
+  setMessages: 'setMessages',
+} as const satisfies Record<Exclude<keyof WidgetInstance, 'destroy'>, string>
+
+type MethodName = keyof typeof COMPONENT_METHODS
+
+/**
+ * Creates the element the widget renders into. By default the widget lives in an open shadow
+ * root, so page styles cannot change it and its styles cannot leak into the page.
+ */
+function createMountPoint(
+  container: HTMLElement,
+  useShadowDom: boolean,
+): { host: HTMLElement; mountPoint: HTMLElement } {
+  // Custom element names and no box of their own: page rules for div or other tags do not apply,
+  // and page CSS that styles every element cannot give these wrappers borders or spacing.
+  const host = document.createElement('clearideas-widget-host')
+  host.setAttribute('data-clearideas-widget-host', '')
+  host.style.display = 'contents'
+  container.appendChild(host)
+
+  const css = getBundledCss()
+  if (useShadowDom && typeof host.attachShadow === 'function') {
+    const shadow = host.attachShadow({ mode: 'open' })
+    applyStyles(shadow, [HOST_CSS, css])
+    const mountPoint = document.createElement('div')
+    shadow.appendChild(mountPoint)
+    return { host, mountPoint }
+  }
+
+  // Without Shadow DOM the widget shares the page's styles (and the page can restyle it).
+  applyStyles(document, [css])
+  return { host, mountPoint: host }
+}
 
 /**
  * Checks if consent has been given based on the hasConsent config
@@ -42,70 +102,25 @@ function checkConsent(hasConsent?: boolean | (() => boolean) | string): boolean 
   return true
 }
 
-/**
- * Creates a no-op widget instance that does nothing until consent is granted
- */
-function createNoOpInstance(): WidgetInstance {
-  return {
-    open: () => {
-      console.warn(
-        '[ClearIdeasWidget] Widget is pending consent. Call init() again after consent is granted.',
-      )
-    },
-    close: () => {},
-    toggle: () => {
-      console.warn(
-        '[ClearIdeasWidget] Widget is pending consent. Call init() again after consent is granted.',
-      )
-    },
-    sendMessage: async (_content: string) => {
-      console.warn(
-        '[ClearIdeasWidget] Widget is pending consent. Call init() again after consent is granted.',
-      )
-    },
-    hide: () => {},
-    show: () => {},
-    openChatDirectly: () => {
-      console.warn(
-        '[ClearIdeasWidget] Widget is pending consent. Call init() again after consent is granted.',
-      )
-    },
-    setDarkMode: (_isDark: boolean) => {},
-    setConsentRequired: (_required: boolean) => {},
-    setConsentGranted: (_granted: boolean) => {},
-    setPosition: (_position: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left') => {},
-    setWidth: (_width: number) => {},
-    setHeight: (_height: number) => {},
-    setTop: (_top: number | undefined) => {},
-    setRight: (_right: number | undefined) => {},
-    setBottom: (_bottom: number | undefined) => {},
-    setLeft: (_left: number | undefined) => {},
-    setFabSize: (_size: number) => {},
-    setActions: (_actions: WidgetAction[]) => {},
-    setUserName: (_name: string | undefined) => {},
-    setUserEmail: (_email: string | undefined) => {},
-    setUserId: (_id: string | undefined) => {},
-    setLocale: (_locale: string | undefined) => {},
-    destroy: () => {},
+/** A widget handle whose methods do nothing (consent pending) or warn (destroyed). */
+function createInertInstance(message: string | null): WidgetInstance {
+  const inert = () => {
+    if (message) console.warn(`[ClearIdeasWidget] ${message}`)
   }
+  const instance = { destroy: () => {} } as WidgetInstance
+  for (const name of Object.keys(COMPONENT_METHODS) as MethodName[]) {
+    ;(instance as any)[name] = name === 'sendMessage' ? async () => inert() : inert
+  }
+  return instance
 }
 
 /**
  * Initialize a Clear Ideas widget instance
  * @param config - Widget configuration
- * @returns Widget instance with control methods
+ * @returns Widget instance with control methods; destroy() removes only this widget
  * @throws {Error} If throwOnMissingConsent is true and consent is not granted
  */
 export function init(config: WidgetConfig): WidgetInstance {
-  // Always log init() calls with stack trace to identify where it's being called from
-  console.log('[ClearIdeasWidget] init() called', {
-    hasAccessKey: !!config.accessKey,
-    hasApiBaseUrl: !!config.apiBaseUrl,
-    consentRequired: config.consentRequired,
-    consentGranted: config.consentGranted,
-    stackTrace: new Error().stack?.split('\n').slice(2, 6).join('\n'),
-  })
-
   // Check consent before initializing
   if (!checkConsent(config.hasConsent)) {
     if (config.throwOnMissingConsent) {
@@ -115,7 +130,9 @@ export function init(config: WidgetConfig): WidgetInstance {
     }
     // Return a no-op instance if consent is not granted (unless throwOnMissingConsent is true)
     console.warn('[ClearIdeasWidget] init() returning no-op instance due to missing consent')
-    return createNoOpInstance()
+    return createInertInstance(
+      'Widget is pending consent. Call init() again after consent is granted.',
+    )
   }
 
   // Validate required props
@@ -128,288 +145,64 @@ export function init(config: WidgetConfig): WidgetInstance {
     )
   }
 
-  // Destroy existing instance if any
-  if (widgetInstance) {
-    console.log('[ClearIdeasWidget] Destroying existing widget instance before creating new one')
-    widgetInstance.destroy()
+  // Options for init() itself are not component props (they would become HTML attributes).
+  const containerOption = config.container
+  const props: Record<string, unknown> = { ...config }
+  for (const option of ['container', 'hasConsent', 'throwOnMissingConsent', 'shadowDom']) {
+    delete props[option]
   }
 
-  const resolvedConfig: WidgetConfig = {
-    ...config,
-  }
-
-  // Find or create container element
-  let container: HTMLElement
-  if (typeof config.container === 'string') {
-    const element = document.querySelector(config.container)
+  // Find the container, or create the default one
+  let container: HTMLElement | null = null
+  if (typeof containerOption === 'string') {
+    const element = document.querySelector(containerOption)
     if (!element) {
-      throw new Error(`Container element "${config.container}" not found`)
+      throw new Error(`Container element "${containerOption}" not found`)
     }
     container = element as HTMLElement
-  } else if (config.container instanceof HTMLElement) {
-    container = config.container
-  } else {
-    // Create default container
-    container = document.createElement('div')
-    container.id = 'clearideas-widget-container'
+  } else if (containerOption instanceof HTMLElement) {
+    container = containerOption
+  }
+  const key: HTMLElement | 'default' = container ?? 'default'
+
+  // A widget already in this container is replaced.
+  widgetsByContainer.get(key)?.destroy()
+
+  let createdContainer: HTMLElement | null = null
+  if (!container) {
+    container = document.createElement('clearideas-widget')
+    container.id = DEFAULT_CONTAINER_ID
+    container.style.display = 'contents'
     document.body.appendChild(container)
+    createdContainer = container
   }
 
-  containerElement = container
+  const { host, mountPoint } = createMountPoint(container, config.shadowDom !== false)
+  const app = createApp(ClearIdeasWidgetStandalone, props as any)
+  const component = app.mount(mountPoint) as unknown as Record<string, (...args: any[]) => any>
+  let destroyed = false
 
-  // Create Vue app
-  const app = createApp(ClearIdeasWidgetStandalone, resolvedConfig as any)
-  const vm = app.mount(container)
-
-  appInstance = app
-
-  // Create widget instance API
-  const componentInstance = vm as any
-
-  widgetInstance = {
-    open: () => {
-      if (componentInstance?.openWidget) {
-        componentInstance.openWidget()
+  const instance = {} as WidgetInstance
+  for (const [name, method] of Object.entries(COMPONENT_METHODS) as [MethodName, string][]) {
+    ;(instance as any)[name] = (...args: unknown[]) => {
+      if (destroyed) {
+        console.warn(`[ClearIdeasWidget] ${name}() called on a destroyed widget`)
+        return name === 'sendMessage' ? Promise.resolve() : undefined
       }
-    },
-    close: () => {
-      if (componentInstance?.closeWidget) {
-        componentInstance.closeWidget()
-      }
-    },
-    toggle: () => {
-      if (componentInstance?.toggleWidget) {
-        componentInstance.toggleWidget()
-      }
-    },
-    sendMessage: async (content: string) => {
-      if (componentInstance?.sendPublicChatMessage) {
-        await componentInstance.sendPublicChatMessage(content)
-      }
-    },
-    hide: () => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] hide() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.hideFab === 'function') {
-        componentInstance.hideFab()
-      } else {
-        console.warn('[ClearIdeasWidget] hideFab method not found on component instance')
-      }
-    },
-    show: () => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] show() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.showFab === 'function') {
-        componentInstance.showFab()
-      } else {
-        console.warn('[ClearIdeasWidget] showFab method not found on component instance')
-      }
-    },
-    openChatDirectly: () => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] openChatDirectly() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.openChatDirectly === 'function') {
-        componentInstance.openChatDirectly()
-      } else {
-        console.warn('[ClearIdeasWidget] openChatDirectly method not found on component instance')
-      }
-    },
-    setDarkMode: (isDark: boolean) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setDarkMode() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setDarkMode === 'function') {
-        componentInstance.setDarkMode(isDark)
-      } else {
-        console.warn('[ClearIdeasWidget] setDarkMode method not found on component instance')
-      }
-    },
-    setConsentRequired: (required: boolean) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setConsentRequired() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setConsentRequired === 'function') {
-        componentInstance.setConsentRequired(required)
-      }
-    },
-    setConsentGranted: (granted: boolean) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setConsentGranted() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setConsentGranted === 'function') {
-        componentInstance.setConsentGranted(granted)
-      }
-    },
-    setPosition: (position: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left') => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setPosition() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setPosition === 'function') {
-        componentInstance.setPosition(position)
-      }
-    },
-    setWidth: (width: number) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setWidth() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setWidth === 'function') {
-        componentInstance.setWidth(width)
-      }
-    },
-    setHeight: (height: number) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setHeight() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setHeight === 'function') {
-        componentInstance.setHeight(height)
-      }
-    },
-    setTop: (top: number | undefined) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setTop() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setTop === 'function') {
-        componentInstance.setTop(top)
-      }
-    },
-    setRight: (right: number | undefined) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setRight() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setRight === 'function') {
-        componentInstance.setRight(right)
-      }
-    },
-    setBottom: (bottom: number | undefined) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setBottom() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setBottom === 'function') {
-        componentInstance.setBottom(bottom)
-      }
-    },
-    setLeft: (left: number | undefined) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setLeft() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setLeft === 'function') {
-        componentInstance.setLeft(left)
-      }
-    },
-    setFabSize: (size: number) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setFabSize() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setFabSize === 'function') {
-        componentInstance.setFabSize(size)
-      }
-    },
-    setActions: (actions: any[]) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setActions() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setActions === 'function') {
-        componentInstance.setActions(actions)
-      }
-    },
-    setUserName: (name: string | undefined) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setUserName() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setUserName === 'function') {
-        componentInstance.setUserName(name)
-      }
-    },
-    setUserEmail: (email: string | undefined) => {
-      if (!componentInstance) {
-        console.warn(
-          '[ClearIdeasWidget] setUserEmail() called but widget instance is not initialized',
-        )
-        return
-      }
-      if (typeof componentInstance.setUserEmail === 'function') {
-        componentInstance.setUserEmail(email)
-      }
-    },
-    setUserId: (id: string | undefined) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setUserId() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setUserId === 'function') {
-        componentInstance.setUserId(id)
-      }
-    },
-    setLocale: (locale: string | undefined) => {
-      if (!componentInstance) {
-        console.warn('[ClearIdeasWidget] setLocale() called but widget instance is not initialized')
-        return
-      }
-      if (typeof componentInstance.setLocale === 'function') {
-        componentInstance.setLocale(locale)
-      }
-    },
-    destroy: () => {
-      // Unmount Vue app
-      if (appInstance) {
-        appInstance.unmount()
-        appInstance = null
-      }
-
-      // Remove container if it was auto-created
-      if (
-        containerElement &&
-        containerElement.parentNode &&
-        containerElement.id === 'clearideas-widget-container'
-      ) {
-        containerElement.parentNode.removeChild(containerElement)
-      }
-
-      widgetInstance = null
-      containerElement = null
-    },
+      return component[method]?.(...args)
+    }
+  }
+  instance.destroy = () => {
+    if (destroyed) return
+    destroyed = true
+    app.unmount() // the component releases its requests, listeners, timers and media
+    host.remove()
+    createdContainer?.remove()
+    if (widgetsByContainer.get(key) === instance) widgetsByContainer.delete(key)
   }
 
-  if (resolvedConfig.locale) {
-    widgetInstance.setLocale(resolvedConfig.locale)
-  }
-
-  return widgetInstance
+  widgetsByContainer.set(key, instance)
+  return instance
 }
 
 // Auto-initialize from data attributes
@@ -419,7 +212,10 @@ if (typeof document !== 'undefined') {
 
 // Expose global API
 if (typeof window !== 'undefined') {
+  // The IIFE bundle replaces this with the exports of index.ts, which include the same members.
   ;(window as any).ClearIdeasWidget = {
     init,
+    /** Tags of the built-in languages, for example to build a language picker. */
+    BUILT_IN_LOCALES,
   }
 }

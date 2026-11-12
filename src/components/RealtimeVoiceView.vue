@@ -5,16 +5,24 @@ import type { RealtimeVoiceConnectionState } from '../composables/useRealtimeVoi
 import { useWidgetI18n } from '../i18n/runtime'
 import { formatDuration } from '../utils/duration'
 
-const props = defineProps<{
-  connectionState: RealtimeVoiceConnectionState
-  isResponding: boolean
-  isMuted: boolean
-  duration: number
-  waveformData: number[]
-  widgetColor: string
-  caption?: string
-  hasUserSpoken?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    connectionState: RealtimeVoiceConnectionState
+    isResponding: boolean
+    isMuted: boolean
+    duration: number
+    waveformData: number[]
+    widgetColor: string
+    caption?: string
+    hasUserSpoken?: boolean
+    /** Why the call failed or stopped, shown (and announced) in the view. */
+    error?: string | null
+    /** Offer recorded voice after a failure (not when the microphone itself is the problem). */
+    canUseRecorded?: boolean
+  }>(),
+  // An absent boolean prop would otherwise be false.
+  { canUseRecorded: true, caption: undefined, hasUserSpoken: false, error: null },
+)
 
 const emit = defineEmits<{ toggleMute: []; end: []; useRecorded: [] }>()
 const { t } = useWidgetI18n()
@@ -70,7 +78,7 @@ const bars = computed(() => {
 </script>
 
 <template>
-  <section class="realtime-voice" aria-label="Live voice conversation">
+  <section class="realtime-voice" :aria-label="t('voice.conversation')">
     <div class="realtime-voice__topline">
       <span class="realtime-voice__live">
         <i></i>
@@ -113,14 +121,16 @@ const bars = computed(() => {
         ref="captionElement"
         class="realtime-voice__caption"
         role="log"
-        aria-label="Live transcript"
+        :aria-label="t('voice.transcript')"
         aria-live="polite"
         tabindex="0"
       >
         {{ caption }}
       </div>
+      <!-- The chat view (where errors usually appear) is hidden during a call. -->
+      <p v-if="error" class="realtime-voice__error" role="alert" dir="auto">{{ error }}</p>
       <button
-        v-if="connectionState === 'failed'"
+        v-if="connectionState === 'failed' && canUseRecorded"
         type="button"
         class="realtime-voice__fallback"
         @click="emit('useRecorded')"
@@ -186,7 +196,7 @@ const bars = computed(() => {
   align-items: center;
   justify-content: space-between;
   font-size: 12px;
-  color: rgba(var(--ci-widget-on-surface), 0.62);
+  color: rgba(var(--ci-widget-on-surface), 0.7);
 }
 
 .realtime-voice__live {
@@ -284,6 +294,7 @@ const bars = computed(() => {
   max-height: 52px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.9);
+  background: color-mix(in srgb, var(--ci-widget-on-accent, #fff) 90%, transparent);
   box-shadow: 0 0 8px rgba(255, 255, 255, 0.42);
   transition: height 90ms linear;
   animation: voice-bar 1.2s ease-in-out infinite alternate;
@@ -314,7 +325,8 @@ const bars = computed(() => {
   display: block;
   margin-top: 6px;
   font-size: 13px;
-  color: rgba(var(--ci-widget-on-surface), 0.58);
+  /* At least 4.5:1 on the panel background (WCAG AA for small text). */
+  color: rgba(var(--ci-widget-on-surface), 0.7);
 }
 
 .realtime-voice__caption {
@@ -332,7 +344,7 @@ const bars = computed(() => {
   color: rgba(var(--ci-widget-on-surface), 0.84);
   font-size: 12.5px;
   line-height: 1.5;
-  text-align: left;
+  text-align: start;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   overflow-y: auto;
@@ -356,12 +368,21 @@ const bars = computed(() => {
   background: rgba(var(--ci-widget-on-surface), 0.22);
 }
 
+.realtime-voice__error {
+  max-width: 280px;
+  margin: 12px auto 0;
+  color: rgb(var(--ci-widget-error-text, 185, 28, 28));
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .realtime-voice__fallback {
   margin-top: 14px;
   padding: 7px 11px;
   border: 0;
   border-radius: 8px;
-  color: var(--voice-color, #375dfb);
+  color: var(--ci-widget-accent-text, var(--voice-color, #375dfb));
   background: transparent;
   font: inherit;
   font-size: 12px;

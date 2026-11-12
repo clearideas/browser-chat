@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { useWidgetI18n } from '../i18n/runtime'
-import { icons } from '../icons'
+import { getIconSVG } from '../icons'
 import { formatDuration } from '../utils/duration'
 
 const props = withDefaults(
@@ -36,29 +36,13 @@ const { t } = useWidgetI18n()
 const emit = defineEmits<{
   'update:modelValue': [value: string]
   send: []
+  stop: []
   'start-recording': []
   'stop-recording': []
   'cancel-recording': []
   focus: []
   blur: []
-  'voice-btn-ref': [element: HTMLElement | null]
-  'send-btn-ref': [element: HTMLElement | null]
-  'cancel-btn-ref': [element: HTMLElement | null]
-  'accept-btn-ref': [element: HTMLElement | null]
 }>()
-
-// Helper function to wrap icon path in SVG tag
-function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
-  const iconPath = icons[iconName]
-  if (!iconPath) return ''
-  let viewBox = '0 0 640 640'
-  if (iconName === 'ciIcon') {
-    viewBox = '0 0 512 512'
-  } else if (iconName === 'chevronRight' || iconName === 'chevronLeft') {
-    viewBox = '0 0 640 640'
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${size}" height="${size}" fill="currentColor">${iconPath}</svg>`
-}
 
 const rows = computed(() => (props.expanded ? 3 : 1))
 
@@ -142,6 +126,10 @@ defineExpose({
 <template>
   <div class="consumer-input">
     <div class="consumer-input__wrapper">
+      <!--
+        Typed text takes its direction from its content (Arabic in an English widget and the other
+        way round). Empty, the box keeps the widget's direction so the placeholder aligns with it.
+      -->
       <textarea
         v-if="!isRecording"
         :value="modelValue"
@@ -150,9 +138,11 @@ defineExpose({
             ? t('input.placeholderVoice')
             : placeholder || t('input.placeholder')
         "
-        :disabled="disabled || loading || isRecording"
+        :disabled="disabled || isRecording"
         :rows="rows"
         class="consumer-input__textarea"
+        :dir="modelValue ? 'auto' : undefined"
+        :aria-label="t('input.placeholder')"
         :class="{
           expanded: expanded,
           'has-voice-btn': voiceEnabled && supportsVoiceRecording,
@@ -181,36 +171,54 @@ defineExpose({
       <template v-if="!isRecording">
         <button
           v-if="voiceEnabled && supportsVoiceRecording"
-          :ref="el => emit('voice-btn-ref', el as HTMLElement | null)"
           class="consumer-input__voice-btn"
+          :data-tooltip="t('input.voiceModeTooltip')"
           :disabled="loading"
           @click="$emit('start-recording')"
           :aria-label="t('input.startVoiceRecording')"
         >
           <span class="ci-widget-icon" v-html="getIconSVG('microphone', 18)"></span>
         </button>
+        <!-- While a reply is in progress the send button becomes a stop button. -->
         <button
-          :ref="el => emit('send-btn-ref', el as HTMLElement | null)"
+          v-if="loading"
+          type="button"
+          class="consumer-input__send consumer-input__stop"
+          :data-tooltip="t('input.stopReply')"
+          data-tooltip-align="end"
+          @click="$emit('stop')"
+          :aria-label="t('input.stopReply')"
+        >
+          <span class="ci-widget-icon" v-html="getIconSVG('stop', 14)"></span>
+        </button>
+        <button
+          v-else
           class="consumer-input__send"
-          :disabled="loading || !modelValue.trim()"
+          :data-tooltip="t('input.sendMessage')"
+          data-tooltip-align="end"
+          :disabled="!modelValue.trim()"
           @click="$emit('send')"
           :aria-label="t('input.sendMessage')"
         >
-          <span class="ci-widget-icon" v-html="getIconSVG('paperPlane', 18)"></span>
+          <span
+            class="ci-widget-icon ci-widget-icon--mirror"
+            v-html="getIconSVG('paperPlane', 18)"
+          ></span>
         </button>
       </template>
       <template v-else>
         <button
-          :ref="el => emit('cancel-btn-ref', el as HTMLElement | null)"
           class="consumer-input__cancel-btn"
+          :data-tooltip="t('input.cancelRecording')"
           @click="$emit('cancel-recording')"
           :aria-label="t('input.cancelRecording')"
         >
           <span class="ci-widget-icon" v-html="getIconSVG('xmark', 18)"></span>
         </button>
         <button
-          :ref="el => emit('accept-btn-ref', el as HTMLElement | null)"
           class="consumer-input__accept-btn"
+          :data-tooltip="t('input.sendRecording')"
+          data-tooltip-align="end"
           @click="$emit('stop-recording')"
           :aria-label="t('input.sendRecording')"
         >
@@ -237,7 +245,7 @@ defineExpose({
   border: 1px solid rgba(145, 145, 145, 0.24);
   border-radius: 8px;
   background: rgb(255, 255, 255);
-  overflow: hidden;
+  /* No overflow clipping: the send and recording buttons' tooltips extend above the box. */
   padding: 2px 0;
 }
 
@@ -258,7 +266,7 @@ defineExpose({
 }
 
 .consumer-input__textarea.has-voice-btn {
-  padding-right: 4px;
+  padding-inline-end: 4px;
 }
 
 .consumer-input__textarea:focus {
@@ -266,7 +274,7 @@ defineExpose({
 }
 
 .consumer-input__wrapper:focus-within {
-  border-color: rgb(var(--ci-widget-feature));
+  border-color: var(--ci-widget-accent);
 }
 
 .consumer-input__textarea:disabled {
@@ -313,7 +321,7 @@ defineExpose({
   width: 4px;
   min-height: 6px;
   max-height: 20px;
-  background: rgb(var(--ci-widget-feature));
+  background: var(--ci-widget-accent);
   border-radius: 2px;
   transition:
     height 0.1s ease-out,
@@ -327,7 +335,7 @@ defineExpose({
   font-weight: 600;
   color: rgb(var(--ci-widget-on-surface));
   min-width: 40px;
-  text-align: right;
+  text-align: end;
   flex-shrink: 0;
 }
 
@@ -360,7 +368,7 @@ defineExpose({
   height: 36px;
   padding: 0;
   align-self: center;
-  margin-left: 4px;
+  margin-inline-start: 4px;
   border: none !important;
   border-radius: 50%;
   background: transparent !important;
@@ -393,7 +401,7 @@ defineExpose({
   width: 36px;
   height: 36px;
   padding: 0;
-  margin-left: 4px;
+  margin-inline-start: 4px;
   border: none !important;
   border-radius: 50%;
   background: transparent !important;
@@ -422,12 +430,12 @@ defineExpose({
   width: 36px;
   height: 36px;
   padding: 0;
-  margin-left: 4px;
-  margin-right: 6px;
+  margin-inline-start: 4px;
+  margin-inline-end: 6px;
   border: none;
   border-radius: 50%;
-  background: rgb(var(--ci-widget-feature));
-  background-color: rgb(var(--ci-widget-feature));
+  background: var(--ci-widget-accent);
+  background-color: var(--ci-widget-accent);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -448,7 +456,7 @@ defineExpose({
 .consumer-input__accept-btn .ci-widget-icon {
   width: 18px;
   height: 18px;
-  color: white;
+  color: var(--ci-widget-on-accent);
 }
 
 .consumer-input__send {
@@ -460,8 +468,8 @@ defineExpose({
   margin-right: 4px;
   border: none;
   border-radius: 50%;
-  background: rgb(var(--ci-widget-feature));
-  background-color: rgb(var(--ci-widget-feature));
+  background: var(--ci-widget-accent);
+  background-color: var(--ci-widget-accent);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -487,7 +495,7 @@ defineExpose({
 .consumer-input__send .ci-widget-icon {
   width: 18px;
   height: 18px;
-  color: rgb(255, 255, 255);
+  color: var(--ci-widget-on-accent);
 }
 
 .consumer-input__send .ci-widget-icon svg path {
@@ -524,8 +532,8 @@ defineExpose({
 }
 
 .ci-widget.ci-widget-dark .consumer-input__accept-btn {
-  background: rgb(var(--ci-widget-feature)) !important;
-  background-color: rgb(var(--ci-widget-feature)) !important;
+  background: var(--ci-widget-accent) !important;
+  background-color: var(--ci-widget-accent) !important;
 }
 
 .ci-widget.ci-widget-dark .consumer-input__cancel-btn {

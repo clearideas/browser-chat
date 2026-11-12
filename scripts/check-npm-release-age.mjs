@@ -24,7 +24,9 @@ function scopeOf(name) {
 }
 
 function registryUrlFor(name) {
-  const encoded = name.startsWith('@') ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name)
+  const encoded = name.startsWith('@')
+    ? `@${encodeURIComponent(name.slice(1))}`
+    : encodeURIComponent(name)
   return `https://registry.npmjs.org/${encoded}`
 }
 
@@ -49,11 +51,13 @@ async function publishedAt(name, version) {
         lastError = error
       }
 
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1000))
+      await new Promise(resolve => setTimeout(resolve, attempt * 1000))
     }
 
     if (!response?.ok) {
-      throw new Error(`Unable to fetch npm metadata for ${name}: ${lastError?.message ?? 'unknown error'}`)
+      throw new Error(
+        `Unable to fetch npm metadata for ${name}: ${lastError?.message ?? 'unknown error'}`,
+      )
     }
     metadataCache.set(name, await response.json())
   }
@@ -96,7 +100,7 @@ for (const [path, pkg] of packages) {
 }
 
 for (let i = 0; i < checks.length; i += 8) {
-  await Promise.all(checks.slice(i, i + 8).map((check) => check()))
+  await Promise.all(checks.slice(i, i + 8).map(check => check()))
 }
 
 if (failures.length) {

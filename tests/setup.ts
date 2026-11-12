@@ -1,5 +1,9 @@
 import { beforeAll, vi } from 'vitest'
 
+import { installConsoleGuard } from './helpers/console-guard'
+
+installConsoleGuard()
+
 function createStorageMock() {
   return {
     getItem: vi.fn(),

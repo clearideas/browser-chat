@@ -1,5 +1,7 @@
 import { computed, type Ref, ref, watch } from 'vue'
 
+import { microphoneErrorKind, type VoiceErrorKind } from '../utils/errors'
+
 const DEFAULT_WAVEFORM_BARS = 25 // Default number of bars to display in waveform
 
 // Silence detection configuration
@@ -13,12 +15,17 @@ const DEBUG_SILENCE =
 export function useVoiceRecording(
   maxDuration: Ref<number>,
   onRecorded: (audioBase64: string, format: string) => Promise<void>,
-  onError: (error: string) => void,
+  onError: (kind: VoiceErrorKind) => void,
   waveformBars?: Ref<number>,
 ) {
   const isRecording = ref<boolean>(false)
   const recordingDuration = ref<number>(0)
   const mediaRecorder = ref<MediaRecorder | null>(null)
+  // Container actually recorded: WebM where supported, MP4 (sent as "m4a") on Safari.
+  let recordedMimeType = 'audio/webm'
+  // Each recording is an attempt; cancelRecording() supersedes it. Work that
+  // resumes after an await (the permission prompt, encoding) checks it is still current.
+  let attempt = 0
   const audioStream = ref<MediaStream | null>(null)
   const recordingTimer = ref<number | null>(null)
   const audioChunks = ref<Blob[]>([])
@@ -138,14 +145,6 @@ export function useVoiceRecording(
 
       // Throttle debug logging to once per second to avoid spam
       if (DEBUG_SILENCE && currentTime - lastDebugLogTime.value > 1000) {
-        console.log('[SilenceDetection]', {
-          amplitude: overallAmplitude.toFixed(4),
-          threshold: SILENCE_THRESHOLD,
-          isSilent,
-          silenceStartTime: silenceStartTime.value,
-          recordingStartTime: recordingStartTime.value,
-          silenceDuration: silenceStartTime.value ? currentTime - silenceStartTime.value : 0,
-        })
         lastDebugLogTime.value = currentTime
       }
 
@@ -154,7 +153,6 @@ export function useVoiceRecording(
         if (silenceStartTime.value === null) {
           silenceStartTime.value = currentTime
           if (DEBUG_SILENCE) {
-            console.log('[SilenceDetection] Started tracking silence')
           }
         } else {
           // Check if silence duration exceeds threshold
@@ -164,12 +162,6 @@ export function useVoiceRecording(
             : 0
 
           if (DEBUG_SILENCE) {
-            console.log('[SilenceDetection] Silence detected', {
-              silenceDurationMs,
-              totalRecordingDurationMs,
-              requiredSilence: SILENCE_DURATION_MS,
-              minRecording: MIN_RECORDING_DURATION_MS,
-            })
           }
 
           // Auto-submit if:
@@ -180,7 +172,6 @@ export function useVoiceRecording(
             totalRecordingDurationMs >= MIN_RECORDING_DURATION_MS
           ) {
             if (DEBUG_SILENCE) {
-              console.log('[SilenceDetection] Auto-submitting due to silence')
             }
             stopRecordingAndSend()
             return // Exit early since we're stopping recording
@@ -189,7 +180,6 @@ export function useVoiceRecording(
       } else {
         // Sound detected - reset silence tracking
         if (silenceStartTime.value !== null && DEBUG_SILENCE) {
-          console.log('[SilenceDetection] Sound detected, resetting silence tracking')
         }
         silenceStartTime.value = null
       }
@@ -204,9 +194,15 @@ export function useVoiceRecording(
   }
 
   async function startRecording() {
+    const current = ++attempt
     try {
       // Request microphone permission
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (current !== attempt) {
+        // Cancelled while the permission prompt was open: release the microphone.
+        stream.getTracks().forEach(track => track.stop())
+        return
+      }
       audioStream.value = stream
 
       // Reset state
@@ -237,7 +233,6 @@ export function useVoiceRecording(
           // Start waveform animation loop
           animationFrameId.value = scheduleAnimationFrame(updateWaveform)
           if (DEBUG_SILENCE) {
-            console.log('[SilenceDetection] Web Audio API initialized, silence detection enabled')
           }
         } catch (err) {
           console.warn(
@@ -256,6 +251,7 @@ export function useVoiceRecording(
 
       // Create MediaRecorder
       const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4'
+      recordedMimeType = mimeType
       const recorder = new MediaRecorder(stream, {
         mimeType,
       })
@@ -281,18 +277,9 @@ export function useVoiceRecording(
         }
       }, 1000)
     } catch (err) {
+      if (current !== attempt) return // cancelled meanwhile; nothing to report
       console.error('[ClearIdeasWidget] Failed to start recording:', err)
-      if (err instanceof Error) {
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          onError('Microphone permission denied. Please allow microphone access to use voice chat.')
-        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-          onError('No microphone found. Please connect a microphone to use voice chat.')
-        } else {
-          onError(`Failed to start recording: ${err.message}`)
-        }
-      } else {
-        onError('Failed to start recording')
-      }
+      onError(microphoneErrorKind(err, 'recording-failed'))
       cleanupRecording()
     }
   }
@@ -311,24 +298,29 @@ export function useVoiceRecording(
     }
 
     // Wait for recorder to stop and process chunks
+    const current = attempt
     setTimeout(() => {
+      if (current !== attempt) return // cancelled before the audio was sent
       if (audioChunks.value.length === 0) {
-        onError('No audio recorded')
+        onError('no-audio')
         cleanupRecording()
         return
       }
 
       // Combine chunks into single blob
-      const audioBlob = new Blob(audioChunks.value, { type: 'audio/webm' })
+      const audioBlob = new Blob(audioChunks.value, { type: recordedMimeType })
 
       // Convert to base64
       const reader = new FileReader()
       reader.onloadend = () => {
+        if (current !== attempt) return
         const base64Audio = (reader.result as string).split(',')[1]
-        onRecorded(base64Audio, 'webm')
+        // Protocol formats: webm, mp3, wav, m4a, ogg (docs/protocol/openapi.yaml VoiceRequest).
+        onRecorded(base64Audio, recordedMimeType === 'audio/mp4' ? 'm4a' : 'webm')
       }
       reader.onerror = () => {
-        onError('Failed to process audio')
+        console.error('[ClearIdeasWidget] Failed to read the recording:', reader.error)
+        onError('recording-failed')
         cleanupRecording()
       }
       reader.readAsDataURL(audioBlob)
@@ -336,6 +328,7 @@ export function useVoiceRecording(
   }
 
   function cancelRecording() {
+    attempt += 1
     if (mediaRecorder.value && mediaRecorder.value.state !== 'inactive') {
       mediaRecorder.value.stop()
     }

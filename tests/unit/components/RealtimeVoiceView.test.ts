@@ -96,4 +96,22 @@ describe('RealtimeVoiceView', () => {
     expect(wrapper.text()).toContain('Could not connect')
     expect(wrapper.emitted('useRecorded')).toHaveLength(1)
   })
+
+  it('shows why the call failed, and offers no recording when the microphone is the problem', () => {
+    const wrapper = mount(RealtimeVoiceView, {
+      props: {
+        connectionState: 'failed',
+        isResponding: false,
+        isMuted: false,
+        duration: 0,
+        waveformData: [],
+        widgetColor: '#375dfb',
+        error: 'Microphone access was denied.',
+        canUseRecorded: false,
+      },
+    })
+    const alert = wrapper.get('[role="alert"]')
+    expect(alert.text()).toBe('Microphone access was denied.')
+    expect(wrapper.find('button.realtime-voice__fallback').exists()).toBe(false)
+  })
 })

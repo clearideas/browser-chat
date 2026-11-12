@@ -191,7 +191,7 @@ describe('Streaming', () => {
         },
         {
           type: 'audio',
-          audio: 'base64audio...',
+          audio: 'UklGRgAAAABXQVZF',
         },
         {
           type: 'done',
@@ -199,7 +199,7 @@ describe('Streaming', () => {
           chatName: 'Test Bot',
           transcript: 'What is the weather?',
           response: 'The weather is sunny.',
-          audio: 'base64audio...',
+          audio: 'UklGRgAAAABXQVZF',
         },
       ]
 

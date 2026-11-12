@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Browser Chat – demo</title>
+    <!--
+      The built widget against the local test server. `npm run dev` serves this page at
+      /dev.html. Query parameters (all optional):
+        key   access key: demo-public-key (default), adversarial-public-key, disabled-public-key
+        lang  page language, which the widget follows (for example fr, pt-BR, zh-TW, ar)
+        api   server URL (default: the test server, from /dev-config.js)
+        user  signed-in user ID (userId), sent to the server in x-clearideas-public-chat-user-id
+      The controls change these live; the page text itself stays in English. The Dark mode switch
+      (top right, tests/e2e/pages/dev-theme.js) is shared by all development pages.
+    -->
+    <script>
+      // Record XSS probes before the widget loads. Hostile fixtures try to set window.__ciXss.
+      window.__ciXssHits = []
+      Object.defineProperty(window, '__ciXss', {
+        configurable: true,
+        get() {
+          return window.__ciXssHits.at(-1)
+        },
+        set(label) {
+          window.__ciXssHits.push(String(label))
+          console.error('[dev.html] XSS probe executed:', label)
+          const banner = document.getElementById('xss-banner')
+          if (banner) {
+            banner.hidden = false
+            banner.textContent = 'XSS probe executed: ' + window.__ciXssHits.join(', ')
+          }
+        },
+      })
+    </script>
+    <link rel="stylesheet" href="/tests/e2e/pages/page.css" />
+    <script src="/tests/e2e/pages/dev-theme.js"></script>
+    <script src="/dev-config.js"></script>
+    <style>
+      body {
+        padding-bottom: 32px;
+      }
+      #xss-banner {
+        background: #b91c1c;
+        color: #fff;
+        padding: 12px 16px;
+        border-radius: 8px;
+        font-weight: 600;
+      }
+      .controls {
+        display: grid;
+        /* minmax(0, …) lets the selects shrink on narrow screens instead of widening the page. */
+        grid-template-columns: max-content minmax(0, 1fr);
+        gap: 10px 16px;
+        padding: 16px;
+        border: 1px solid var(--page-border);
+        border-radius: 8px;
+      }
+      .controls .user {
+        display: flex;
+        gap: 8px;
+      }
+      .controls input[type='text'] {
+        font: inherit;
+        padding: 4px 8px;
+        min-width: 0;
+        flex: 1;
+      }
+      .controls select {
+        font: inherit;
+        padding: 4px 8px;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="xss-banner" role="alert" hidden></div>
+    <p><a href="/">← All development pages</a></p>
+    <h1>Browser Chat – demo</h1>
+    <p>
+      The widget below talks to the local test server (<code id="api"></code>), which returns canned
+      replies and never calls an AI service.
+    </p>
+
+    <form class="controls" id="controls">
+      <label for="site">Site</label>
+      <select id="site" name="key">
+        <option value="demo-public-key">Demo – a normal configuration</option>
+        <option value="adversarial-public-key">Adversarial – hostile configuration</option>
+        <option value="disabled-public-key">Disabled – chat switched off (launcher hidden)</option>
+        <option value="voice-public-key">Voice – realtime and recorded voice</option>
+        <option value="recorded-voice-public-key">Recorded voice only</option>
+      </select>
+
+      <label for="lang">Language</label>
+      <select id="lang" name="lang"></select>
+
+      <label for="position">Position</label>
+      <select id="position">
+        <option value="bottom-right">Bottom right</option>
+        <option value="bottom-left">Bottom left</option>
+        <option value="top-right">Top right</option>
+        <option value="top-left">Top left</option>
+      </select>
+
+      <label for="user-id">Signed-in user ID</label>
+      <span class="user">
+        <input id="user-id" type="text" placeholder="empty: signed out" autocomplete="off" />
+        <button id="apply-user" type="submit">Apply</button>
+      </span>
+    </form>
+    <p class="hint">
+      Language sets the page's <code>&lt;html lang&gt;</code>, and the Dark mode switch (top right)
+      sets <code>class="dark"</code> on it. The widget follows both without a reload, and the test
+      server answers in the same language. The demo site's theme mode is “system”: without a page
+      theme, the widget follows the system preference.
+    </p>
+    <p>
+      Widget language: <strong id="widget-locale">…</strong> · Widget theme:
+      <strong id="widget-theme">…</strong>
+    </p>
+
+    <section id="adversarial-notice" class="notice" hidden>
+      <p>
+        <strong>This site is hostile on purpose.</strong> Its configuration puts script-carrying
+        HTML such as <code>&lt;img src=x onerror=…&gt;</code> into the assistant name, greeting,
+        headline, tagline, disclaimer and hello bubble, plus a script in the icon URL,
+        <code>javascript:</code> and <code>data:</code> links, and CSS in the color. Its content is
+        in English only.
+      </p>
+      <p>
+        <strong>Seeing that markup as plain text in the widget is the expected, safe result</strong
+        >: the widget never turns server data into HTML. The unsafe links are dropped, and the icon
+        and color fall back to defaults. If any payload ran, a red banner would appear above.
+      </p>
+    </section>
+
+    <h2>Try it</h2>
+    <ul>
+      <li>Open the chat and send any message: the server echoes it back.</li>
+      <li>
+        Voice sites: click the microphone. Realtime voice answers every two seconds of speech with a
+        canned spoken reply (a tone); recorded voice answers a recording with a canned reply and
+        audio. The server does not recognize speech: transcripts are placeholders.
+      </li>
+      <li>
+        Enter a signed-in user ID and send <code>/fixture whoami</code>: the server replies with the
+        ID it received. Each user ID has its own conversation; switching back restores it.
+      </li>
+      <li>
+        Send <code>/fixture help</code> for the reply scenarios: Markdown, citations, errors,
+        dropped connections, stream formats and hostile content. The scenario list and sample
+        replies are in English; greetings, echoes and error messages follow the language.
+      </li>
+      <li>
+        Stop the test server and click the launcher: a “Chat is unavailable” notice appears, and the
+        next click tries again.
+      </li>
+    </ul>
+    <p>
+      The widget stores its session in <code>localStorage</code> (separately for each server and
+      site) and caches configuration for five minutes.
+      <button id="reset" type="button">Clear widget storage and reload</button>
+    </p>
+
+    <script src="/dist/clearideas-widget.iife.js"></script>
+    <script>
+      const params = new URLSearchParams(location.search)
+      const apiBaseUrl = params.get('api') || window.CHAT_DEV_API_URL
+      const accessKey = params.get('key') || 'demo-public-key'
+      if (params.get('lang')) document.documentElement.lang = params.get('lang')
+
+      document.getElementById('api').textContent = apiBaseUrl
+      document.getElementById('adversarial-notice').hidden = accessKey !== 'adversarial-public-key'
+
+      // Site: reloads with the new key, keeping the other parameters.
+      const site = document.getElementById('site')
+      site.value = accessKey
+      site.addEventListener('change', () => {
+        params.set('key', site.value)
+        location.search = params.toString()
+      })
+
+      // Language: each built-in locale, named in its own language.
+      const lang = document.getElementById('lang')
+      for (const tag of window.ClearIdeasWidget.BUILT_IN_LOCALES) {
+        const name = new Intl.DisplayNames([tag], { type: 'language' }).of(tag)
+        lang.add(new Option(`${name} (${tag})`, tag))
+      }
+      lang.value = window.ClearIdeasWidget.BUILT_IN_LOCALES.includes(document.documentElement.lang)
+        ? document.documentElement.lang
+        : 'en'
+      lang.addEventListener('change', () => {
+        document.documentElement.lang = lang.value
+        params.set('lang', lang.value)
+        history.replaceState(null, '', `?${params}`)
+      })
+
+      // Shows what the widget chose, read from its root element (in its shadow root).
+      function showWidgetState() {
+        const root = document
+          .querySelector('[data-clearideas-widget-host]')
+          ?.shadowRoot?.querySelector('.ci-widget')
+        document.getElementById('widget-locale').textContent = root
+          ? `${root.lang} (${root.dir})`
+          : 'not rendered'
+        document.getElementById('widget-theme').textContent = root
+          ? root.classList.contains('ci-widget-dark')
+            ? 'dark'
+            : 'light'
+          : 'not rendered'
+      }
+      setInterval(showWidgetState, 250)
+
+      document.getElementById('reset').addEventListener('click', () => {
+        for (const storage of [localStorage, sessionStorage]) {
+          for (const key of Object.keys(storage)) {
+            if (key.startsWith('clearideas')) storage.removeItem(key)
+          }
+        }
+        location.reload()
+      })
+
+      window.devWidget = window.ClearIdeasWidget.init({
+        accessKey,
+        apiBaseUrl,
+        userId: params.get('user') || undefined,
+      })
+
+      document
+        .getElementById('position')
+        .addEventListener('change', event => window.devWidget.setPosition(event.target.value))
+      // setUserId() switches the conversation; `/fixture whoami` shows what the server received.
+      const userInput = document.getElementById('user-id')
+      userInput.value = params.get('user') ?? ''
+      document.getElementById('apply-user').addEventListener('click', () => {
+        window.devWidget.setUserId(userInput.value.trim() || undefined)
+        if (userInput.value.trim()) params.set('user', userInput.value.trim())
+        else params.delete('user')
+        history.replaceState(null, '', `?${params}`)
+      })
+      document
+        .getElementById('controls')
+        .addEventListener('submit', event => event.preventDefault())
+      showWidgetState()
+    </script>
+  </body>
+</html>

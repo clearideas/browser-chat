@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { icons } from '../icons'
+import { useWidgetI18n } from '../i18n/runtime'
+import { getIconSVG, type IconName } from '../icons'
 import type { WidgetAction } from '../types'
 
 const props = defineProps<{
@@ -7,52 +8,60 @@ const props = defineProps<{
   widgetColor: string
 }>()
 
+const { t } = useWidgetI18n()
+
 const emit = defineEmits<{
   action: [action: WidgetAction]
 }>()
-
-// Helper function to wrap icon path in SVG tag
-function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
-  const iconPath = icons[iconName]
-  if (!iconPath) return ''
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" width="${size}" height="${size}" fill="currentColor">${iconPath}</svg>`
-}
 </script>
 
 <template>
   <template v-for="action in props.actions" :key="action.id">
-    <div
+    <button
+      type="button"
       class="ci-widget-action"
       :class="{ 'ci-widget-action--chat': action.type === 'chat' }"
       @click="emit('action', action)"
       :style="
         action.type === 'chat'
           ? {
-              backgroundColor: props.widgetColor || '#ED613F',
-              color: '#ffffff',
+              backgroundColor: props.widgetColor,
+              color: 'var(--ci-widget-on-accent)',
             }
           : {}
       "
     >
-      <div class="ci-widget-action__left">
-        <div class="ci-widget-action__title">{{ action.title }}</div>
-        <div class="ci-widget-action__sub">{{ action.description }}</div>
-      </div>
-      <div class="ci-widget-action__right">
+      <span class="ci-widget-action__left">
+        <span class="ci-widget-action__title" dir="auto">{{ action.title }}</span>
+        <span class="ci-widget-action__sub" dir="auto">{{ action.description }}</span>
+        <span v-if="action.type === 'link'" class="ci-sr-only">{{ t('chat.opensInNewTab') }}</span>
+      </span>
+      <span class="ci-widget-action__right">
         <span
           v-if="action.icon && action.type === 'chat'"
           class="ci-widget-icon"
-          v-html="getIconSVG((action.icon as keyof typeof icons) || 'sparkles', 18)"
+          v-html="getIconSVG((action.icon as IconName) || 'sparkles', 18)"
         ></span>
-        <span v-else class="ci-widget-icon" v-html="getIconSVG('chevronRight', 16)"></span>
-      </div>
-    </div>
+        <span
+          v-else
+          class="ci-widget-icon ci-widget-icon--mirror"
+          v-html="getIconSVG('chevronRight', 16)"
+        ></span>
+      </span>
+    </button>
   </template>
 </template>
 
 <style scoped>
 .ci-widget-action {
   display: flex;
+  /* A button: full width (as the former block element) with padding inside that width. */
+  box-sizing: border-box;
+  width: calc(100% - 24px);
+  border: none;
+  font: inherit;
+  text-align: start;
+  color: inherit;
   align-items: center;
   justify-content: space-between;
   margin: 12px 12px 8px 12px;
@@ -76,13 +85,13 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
 }
 
 .ci-widget-action--chat {
-  color: #ffffff !important;
+  color: var(--ci-widget-on-accent) !important;
 }
 
 .ci-widget-action--chat .ci-widget-action__title,
 .ci-widget-action--chat .ci-widget-action__sub,
 .ci-widget-action--chat .ci-widget-action__right {
-  color: #ffffff !important;
+  color: var(--ci-widget-on-accent) !important;
 }
 
 .ci-widget-action--chat .ci-widget-action__sub {
@@ -90,20 +99,25 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
 }
 
 .ci-widget-action--chat .ci-widget-icon {
-  color: #ffffff !important;
+  color: var(--ci-widget-on-accent) !important;
 }
 
 .ci-widget-action__left {
+  display: block;
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .ci-widget-action__title {
+  display: block;
   font-weight: 600;
   font-size: 14px;
   color: rgb(var(--ci-widget-on-surface)) !important;
 }
 
 .ci-widget-action__sub {
+  display: block;
   font-size: 12px;
   color: rgba(var(--ci-widget-on-surface), var(--ci-widget-medium-emphasis-opacity));
 }
@@ -111,7 +125,7 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
 .ci-widget-action__right {
   display: flex;
   align-items: center;
-  color: rgb(var(--ci-widget-feature));
+  color: var(--ci-widget-accent-text);
 }
 
 .ci-widget-action__right .ci-widget-icon {
