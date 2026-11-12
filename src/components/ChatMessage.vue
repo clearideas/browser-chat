@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { type ComponentPublicInstance, computed } from 'vue'
+import { computed } from 'vue'
 
 import { useWidgetI18n } from '../i18n/runtime'
-import { icons } from '../icons'
+import { getIconSVG } from '../icons'
 import type { ChatMessage as ChatMessageType } from '../types'
-import { formatMessage } from '../utils/markdown'
+import MarkdownContent from './MarkdownContent'
 
 const props = defineProps<{
   message: ChatMessageType
@@ -52,21 +52,7 @@ const widgetColorOpacity50 = computed(() => {
 const emit = defineEmits<{
   toggle: [index: number, audio: string]
   seek: [index: number, time: number]
-  'audio-btn-ref': [index: number, element: HTMLElement | null]
 }>()
-
-// Helper function to wrap icon path in SVG tag
-function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
-  const iconPath = icons[iconName]
-  if (!iconPath) return ''
-  let viewBox = '0 0 640 640'
-  if (iconName === 'ciIcon') {
-    viewBox = '0 0 512 512'
-  } else if (iconName === 'chevronRight' || iconName === 'chevronLeft') {
-    viewBox = '0 0 640 640'
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${size}" height="${size}" fill="currentColor">${iconPath}</svg>`
-}
 
 function handleToggle() {
   if (props.message.audio) {
@@ -78,18 +64,6 @@ function handleSeek(event: Event) {
   const target = event.target as HTMLInputElement
   emit('seek', props.index, parseFloat(target.value))
 }
-
-function handleRef(el: Element | ComponentPublicInstance | null, _refs?: Record<string, any>) {
-  if (el && el instanceof HTMLElement) {
-    emit('audio-btn-ref', props.index, el)
-  }
-}
-
-// Memoize formatted content to avoid re-processing during audio streaming
-// Only recompute when message.content changes, not when audio state changes
-const formattedContent = computed(() => {
-  return props.message.content ? formatMessage(props.message.content) : ''
-})
 </script>
 
 <template>
@@ -101,18 +75,30 @@ const formattedContent = computed(() => {
     }"
   >
     <div class="ci-widget-message__content">
-      <div class="ci-widget-message__text" v-html="formattedContent"></div>
+      <span class="ci-sr-only">
+        {{ message.role === 'user' ? t('chat.youSaid') : t('chat.assistantSaid') }}
+      </span>
+      <!-- Assistant content is Markdown; visitor messages are shown exactly as typed. -->
+      <div v-if="message.role === 'assistant'" class="ci-widget-message__text" dir="auto">
+        <MarkdownContent :source="message.content" />
+      </div>
+      <div
+        v-else
+        class="ci-widget-message__text ci-widget-message__text--plain"
+        dir="auto"
+        v-text="message.content"
+      ></div>
       <!-- Audio controls for assistant messages with audio -->
       <div
         v-if="message.role === 'assistant' && message.audio"
         class="ci-widget-message__audio-controls"
       >
         <button
-          :ref="handleRef"
           class="ci-widget-audio-btn"
           :class="{ active: isPlaying }"
           @click="handleToggle"
           :aria-label="isPlaying ? t('audio.pause') : t('audio.play')"
+          :data-tooltip="isPlaying ? t('audio.pause') : t('audio.play')"
         >
           <span class="ci-widget-icon" v-html="getIconSVG(isPlaying ? 'pause' : 'play', 14)"></span>
         </button>
@@ -149,7 +135,7 @@ const formattedContent = computed(() => {
 
 .ci-widget-message--user .ci-widget-message__content {
   background: v-bind(widgetColor);
-  color: #ffffff;
+  color: var(--ci-widget-on-accent);
   border-radius: 12px 12px 4px 12px;
   max-width: 85%;
 }
@@ -302,7 +288,7 @@ const formattedContent = computed(() => {
 
 .ci-widget-audio-btn.active {
   background: v-bind(widgetColor);
-  color: #ffffff;
+  color: var(--ci-widget-on-accent);
   border-color: v-bind(widgetColor);
 }
 
@@ -320,8 +306,9 @@ const formattedContent = computed(() => {
 
 .ci-widget-message--user .ci-widget-audio-btn {
   background: rgba(255, 255, 255, 0.2);
-  color: #ffffff;
+  color: var(--ci-widget-on-accent);
   border-color: rgba(255, 255, 255, 0.3);
+  border-color: color-mix(in srgb, currentColor 30%, transparent);
 }
 
 .ci-widget-message--user .ci-widget-audio-btn:hover {
@@ -361,18 +348,12 @@ const formattedContent = computed(() => {
 </style>
 
 <style scoped>
-/* Deep selectors for markdown content rendered via v-html */
-.ci-widget-message__text :deep(chunkid),
-.ci-widget-message__text :deep(ChunkId) {
-  display: none !important;
+/* Visitor messages keep their line breaks. */
+.ci-widget-message__text--plain {
+  white-space: pre-wrap;
 }
 
-.ci-widget-message__text :deep(websource),
-.ci-widget-message__text :deep(WebSource),
-.ci-widget-message__text :deep(webSource) {
-  display: none !important;
-}
-
+/* Markdown content rendered by MarkdownContent */
 .ci-widget-message__text :deep(> *:last-child) {
   margin-bottom: 0 !important;
 }
@@ -409,7 +390,7 @@ const formattedContent = computed(() => {
 .ci-widget-message__text :deep(ul),
 .ci-widget-message__text :deep(ol) {
   margin: 8px 0;
-  padding-left: 20px;
+  padding-inline-start: 20px;
 }
 
 .ci-widget-message__text :deep(li) {
@@ -441,14 +422,14 @@ const formattedContent = computed(() => {
 }
 
 .ci-widget-message__text :deep(blockquote) {
-  border-left: 3px solid v-bind(widgetColorOpacity50);
-  padding-left: 12px;
+  border-inline-start: 3px solid v-bind(widgetColorOpacity50);
+  padding-inline-start: 12px;
   margin: 8px 0;
   color: rgba(var(--ci-widget-on-surface), var(--ci-widget-medium-emphasis-opacity));
 }
 
 .ci-widget-message__text :deep(a) {
-  color: v-bind(widgetColor);
+  color: var(--ci-widget-accent-text);
   text-decoration: underline;
 }
 
@@ -474,13 +455,6 @@ const formattedContent = computed(() => {
   font-weight: 600;
 }
 
-.ci-widget-message__text :deep(img) {
-  max-width: 100%;
-  height: auto;
-  border-radius: 8px;
-  margin: 8px 0;
-}
-
 .ci-widget-message__text :deep(hr) {
   border: none;
   border-top: 1px solid rgba(var(--ci-widget-border-color), var(--ci-widget-border-opacity));
@@ -490,11 +464,11 @@ const formattedContent = computed(() => {
 .ci-widget-message__text :deep(.chat-source) {
   font-size: 11px;
   cursor: pointer;
-  color: v-bind(widgetColor);
+  color: var(--ci-widget-accent-text);
   font-weight: normal;
   text-decoration: none;
   display: inline;
-  margin-left: 2px;
+  margin-inline-start: 2px;
   background-color: rgb(var(--ci-widget-background));
   padding: 0px 8px 0px 8px;
   border-radius: 8px;
@@ -510,7 +484,7 @@ const formattedContent = computed(() => {
 }
 
 .ci-widget-message__text :deep(.web-source) {
-  color: v-bind(widgetColor);
+  color: var(--ci-widget-accent-text);
   text-decoration: underline;
   display: inline-flex;
   align-items: center;
@@ -520,48 +494,6 @@ const formattedContent = computed(() => {
 .ci-widget-message__text :deep(.web-source:hover) {
   text-decoration: none;
   opacity: 0.8;
-}
-
-.ci-widget-message__text :deep(.web-source-icon) {
-  width: 12px;
-  height: 12px;
-  flex-shrink: 0;
-  display: inline-block;
-  vertical-align: middle;
-}
-
-.ci-widget-message__text :deep(.web-source-icon svg) {
-  width: 100%;
-  height: 100%;
-  fill: currentColor;
-}
-
-.ci-widget-message__text :deep(.web-source-text) {
-  display: inline;
-}
-
-.ci-widget-message__text :deep(.source-chip) {
-  display: flex;
-  align-items: center;
-  flex-direction: row;
-  font-size: 12px;
-  line-height: 16px;
-  gap: 6px;
-  font-weight: 500;
-  padding: 2px;
-}
-
-.ci-widget-message__text :deep(.source-chip .svg-icon) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-}
-
-.ci-widget-message__text :deep(.source-chip .svg-icon svg) {
-  fill: #fff;
 }
 </style>
 

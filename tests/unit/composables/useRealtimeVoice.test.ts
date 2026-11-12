@@ -392,4 +392,80 @@ describe('useRealtimeVoice', () => {
     expect(voice.connectionState.value).toBe('failed')
     expect(peer.close).toHaveBeenCalled()
   })
+  describe('cancellation', () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void
+      const promise = new Promise<T>(done => (resolve = done))
+      return { promise, resolve }
+    }
+
+    it('releases the microphone and stops if ended while the permission prompt is open', async () => {
+      const permission = deferred<any>()
+      ;(global.navigator.mediaDevices.getUserMedia as any).mockReturnValue(permission.promise)
+      const voice = createVoice()
+
+      const connecting = voice.connect()
+      voice.disconnect()
+      permission.resolve({
+        getTracks: () => [localTrack],
+        getAudioTracks: () => [localTrack],
+      })
+      await expect(connecting).resolves.toBeUndefined()
+
+      expect(localTrack.stop).toHaveBeenCalled()
+      expect(global.RTCPeerConnection).not.toHaveBeenCalled()
+      expect(global.fetch).not.toHaveBeenCalled()
+      expect(voice.connectionState.value).toBe('closed')
+    })
+
+    it('aborts the session request and never answers the offer if ended meanwhile', async () => {
+      const response = deferred<any>()
+      let signal: AbortSignal | undefined
+      ;(global.fetch as any).mockImplementation((_url: string, init: RequestInit) => {
+        signal = init.signal ?? undefined
+        return response.promise
+      })
+      const voice = createVoice()
+
+      const connecting = voice.connect()
+      await vi.waitFor(() => expect(global.fetch).toHaveBeenCalled())
+      voice.disconnect()
+      expect(signal?.aborted).toBe(true)
+      response.resolve({
+        ok: true,
+        json: async () => ({
+          provider: 'openai',
+          transport: 'webrtc',
+          sdp: 'late-answer',
+          realtimeSessionId: 'late',
+        }),
+      })
+      await expect(connecting).resolves.toBeUndefined()
+
+      expect(peer.setRemoteDescription).not.toHaveBeenCalled()
+      expect(peer.close).toHaveBeenCalled()
+      expect(localTrack.stop).toHaveBeenCalled()
+      expect(voice.connectionState.value).toBe('closed')
+    })
+
+    it('does not let an abandoned attempt tear down a newer connection', async () => {
+      const firstPermission = deferred<any>()
+      const firstTrack = { enabled: true, stop: vi.fn() }
+      ;(global.navigator.mediaDevices.getUserMedia as any).mockReturnValueOnce(
+        firstPermission.promise,
+      )
+      const voice = createVoice()
+
+      const first = voice.connect()
+      voice.disconnect()
+      await voice.connect() // second attempt connects normally
+      expect(voice.connectionState.value).toBe('connected')
+
+      firstPermission.resolve({ getTracks: () => [firstTrack], getAudioTracks: () => [firstTrack] })
+      await first
+      expect(firstTrack.stop).toHaveBeenCalled() // the late stream is released
+      expect(localTrack.stop).not.toHaveBeenCalled() // the live call keeps its microphone
+      expect(voice.connectionState.value).toBe('connected')
+    })
+  })
 })

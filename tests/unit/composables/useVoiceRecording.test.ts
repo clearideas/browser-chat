@@ -3,6 +3,7 @@ import { ref } from 'vue'
 
 import { useVoiceRecording } from '@/composables/useVoiceRecording'
 
+import { expectConsole } from '../../helpers/console-guard'
 import { createMockAudioContext, createMockMediaRecorder } from '../../helpers/mocks'
 
 describe('useVoiceRecording', () => {
@@ -50,6 +51,7 @@ describe('useVoiceRecording', () => {
   })
 
   it('handles microphone permission denied', async () => {
+    expectConsole('error', /Failed to start recording: .*NotAllowedError/)
     const maxDuration = ref(60)
     const onRecorded = vi.fn()
     const onError = vi.fn()
@@ -63,12 +65,11 @@ describe('useVoiceRecording', () => {
     await startRecording()
 
     expect(isRecording.value).toBe(false)
-    expect(onError).toHaveBeenCalledWith(
-      'Microphone permission denied. Please allow microphone access to use voice chat.',
-    )
+    expect(onError).toHaveBeenCalledWith('microphone-denied')
   })
 
   it('handles no microphone found', async () => {
+    expectConsole('error', /Failed to start recording: .*NotFoundError/)
     const maxDuration = ref(60)
     const onRecorded = vi.fn()
     const onError = vi.fn()
@@ -82,9 +83,7 @@ describe('useVoiceRecording', () => {
     await startRecording()
 
     expect(isRecording.value).toBe(false)
-    expect(onError).toHaveBeenCalledWith(
-      'No microphone found. Please connect a microphone to use voice chat.',
-    )
+    expect(onError).toHaveBeenCalledWith('microphone-missing')
   })
 
   it('tracks recording duration', async () => {
@@ -376,5 +375,74 @@ describe('useVoiceRecording', () => {
     cancelRecording()
 
     expect(stopTrack).toHaveBeenCalled()
+  })
+  describe('cancellation', () => {
+    it('releases the microphone and does not record if cancelled while the permission prompt is open', async () => {
+      const track = { stop: vi.fn() }
+      let grant!: (stream: unknown) => void
+      ;(global.navigator.mediaDevices as any).getUserMedia.mockReturnValueOnce(
+        new Promise(resolve => (grant = resolve)),
+      )
+      const onRecorded = vi.fn()
+      const onError = vi.fn()
+      const { startRecording, cancelRecording, isRecording } = useVoiceRecording(
+        ref(60),
+        onRecorded,
+        onError,
+      )
+
+      const starting = startRecording()
+      cancelRecording()
+      grant({ getTracks: () => [track] })
+      await starting
+
+      expect(isRecording.value).toBe(false)
+      expect(track.stop).toHaveBeenCalled()
+      expect(global.MediaRecorder).not.toHaveBeenCalled()
+      expect(onError).not.toHaveBeenCalled()
+      expect(onRecorded).not.toHaveBeenCalled()
+    })
+
+    it('does not send audio if cancelled after stopping but before it is encoded', async () => {
+      const mockBlob = new Blob(['audio'], { type: 'audio/webm' })
+      const mockFileReader = {
+        readAsDataURL: vi.fn(function (this: any) {
+          setTimeout(() => {
+            mockFileReader.result = 'data:audio/webm;base64,YXVkaW8='
+            mockFileReader.onloadend?.()
+          }, 10)
+        }),
+        result: '',
+        onloadend: null as any,
+        onerror: null as any,
+      }
+      global.FileReader = vi.fn(function () {
+        return mockFileReader
+      }) as any
+      ;(global.navigator.mediaDevices as any).getUserMedia.mockResolvedValueOnce({
+        getTracks: () => [{ stop: vi.fn() }],
+      })
+      const mockRecorder = createMockMediaRecorder({
+        onStop: () => mockRecorder.ondataavailable?.({ data: mockBlob }),
+      })
+      ;(global.MediaRecorder as any).mockImplementation(function () {
+        return mockRecorder
+      })
+      const onRecorded = vi.fn()
+      const onError = vi.fn()
+      const { startRecording, stopRecordingAndSend, cancelRecording } = useVoiceRecording(
+        ref(60),
+        onRecorded,
+        onError,
+      )
+
+      await startRecording()
+      stopRecordingAndSend()
+      cancelRecording() // for example the visitor closed the widget
+      await new Promise(resolve => setTimeout(resolve, 200))
+
+      expect(onRecorded).not.toHaveBeenCalled()
+      expect(onError).not.toHaveBeenCalled() // a deliberate cancel is not an error
+    })
   })
 })

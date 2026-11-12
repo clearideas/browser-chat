@@ -1,28 +1,18 @@
 /**
- * Debug logging utility
- * Enable debugging from console:
+ * Debug logging, off by default. Enable it from the browser console:
  *   window.__ClearIdeasWidgetDebug = true
+ * Warnings and errors are always logged with console.warn/console.error.
  */
 
-// Log immediately when this module loads to verify it's executing
-if (typeof window !== 'undefined') {
-  console.log('[ClearIdeasWidget] Debug utility loaded')
-}
-
-// Helper function to check debug state
 function isDebugEnabled(): boolean {
   if (typeof window === 'undefined') return false
   return !!(window as any).__ClearIdeasWidgetDebug
 }
 
 export const debugLog = (...args: unknown[]): void => {
-  if (isDebugEnabled()) {
-    console.log(...args)
-  }
+  if (isDebugEnabled()) console.info(...args)
 }
 
 export const debugWarn = (...args: unknown[]): void => {
-  if (isDebugEnabled()) {
-    console.warn(...args)
-  }
+  if (isDebugEnabled()) console.warn(...args)
 }

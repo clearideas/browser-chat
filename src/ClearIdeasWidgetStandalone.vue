@@ -1,7 +1,4 @@
 <script setup lang="ts">
-import 'tippy.js/dist/tippy.css'
-
-import tippy from 'tippy.js'
 import type { CSSProperties } from 'vue'
 import { computed, nextTick, onMounted, onUnmounted, ref, unref, watch } from 'vue'
 
@@ -11,16 +8,16 @@ import RealtimeVoiceView from './components/RealtimeVoiceView.vue'
 import WidgetFAB from './components/WidgetFAB.vue'
 import WidgetHeader from './components/WidgetHeader.vue'
 import WidgetHomeView from './components/WidgetHomeView.vue'
-import { useAudioPlayback } from './composables/useAudioPlayback'
+import { type MessageAudioState, useAudioPlayback } from './composables/useAudioPlayback'
 import { useRealtimeVoice } from './composables/useRealtimeVoice'
 import { useVoiceRecording } from './composables/useVoiceRecording'
 import {
-  setWidgetLocale,
+  provideWidgetI18n,
   startWidgetLocaleTracking,
   stopWidgetLocaleTracking,
-  useWidgetI18n,
 } from './i18n/runtime'
-import { icons } from './icons'
+import type { WidgetMessagesOption } from './i18n/types'
+import { getIconSVG } from './icons'
 import type {
   ChatMessage,
   InitResponse,
@@ -29,28 +26,35 @@ import type {
   WidgetAction,
   WidgetProps,
 } from './types'
+import { accentPalette, accentVariables } from './utils/color'
 import { debugLog, debugWarn } from './utils/debug'
+import {
+  errorStatus,
+  microphoneErrorKind,
+  ServerMessageError,
+  VOICE_ERROR_KEYS,
+  type VoiceErrorKind,
+} from './utils/errors'
+import { uniqueId } from './utils/ids'
+import { currentPageTheme, startPageThemeTracking, stopPageThemeTracking } from './utils/page-theme'
 import {
   trackRealtimeTranscriptMessage,
   upsertRealtimeTranscriptMessage,
 } from './utils/realtimeTranscript'
+import { openExternal, safeColor, safeWebUrl } from './utils/safe'
+import { createSseParser } from './utils/sse'
+import {
+  getBrowserStorage,
+  migrateLegacyKeys,
+  readItem,
+  removeItem,
+  storageKey,
+  type StorageKeyName,
+  storageNamespace,
+  writeItem,
+} from './utils/storage'
 
 // Log immediately when component script loads
-console.log('[ClearIdeasWidget] Component script loaded')
-
-// Helper function to wrap icon path in SVG tag
-function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
-  const iconPath = icons[iconName]
-  if (!iconPath) return ''
-  // Determine viewBox based on icon
-  let viewBox = '0 0 640 640' // default
-  if (iconName === 'ciIcon') {
-    viewBox = '0 0 512 512'
-  } else if (iconName === 'chevronRight' || iconName === 'chevronLeft') {
-    viewBox = '0 0 640 640'
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${size}" height="${size}" fill="currentColor">${iconPath}</svg>`
-}
 
 const props = withDefaults(defineProps<WidgetProps>(), {
   openOnLoad: false,
@@ -61,26 +65,15 @@ const props = withDefaults(defineProps<WidgetProps>(), {
   consentRequired: false,
   consentGranted: false,
   locale: undefined,
+  // Without this default Vue turns an absent boolean prop into false, and the widget would never
+  // follow the server's theme mode, the page theme or the system preference.
+  darkMode: undefined,
 })
-const { locale: widgetLocale, t } = useWidgetI18n()
+// This widget's locale (shared with its child components, separate from other widgets).
+const i18n = provideWidgetI18n()
+const { locale: widgetLocale, dir: widgetDir, t } = i18n
 
-// Container ref for click handlers and tippy initialization
-const messageContentContainer = ref<HTMLElement | null>(null)
-
-// Button refs for tooltip initialization
-const voiceBtnRef = ref<HTMLElement | null>(null)
-const sendBtnRef = ref<HTMLElement | null>(null)
-const cancelBtnRef = ref<HTMLElement | null>(null)
-const acceptBtnRef = ref<HTMLElement | null>(null)
-const backBtnRef = ref<HTMLElement | null>(null)
-const closeBtnRef = ref<HTMLElement | null>(null)
-const newChatBtnRef = ref<HTMLElement | null>(null)
-const fabBtnRef = ref<HTMLElement | null>(null)
-const audioBtnRefs = ref<Map<number, HTMLElement>>(new Map())
 const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
-
-// Store tippy instances to avoid recreating them
-const tippyInstances = ref<Map<HTMLElement, any>>(new Map())
 
 // Local state for public chat
 const messages = ref<ChatMessage[]>([])
@@ -89,7 +82,10 @@ const error = ref<string | null>(null)
 const chatId = ref<string | null>(null)
 const chatName = ref<string>('')
 const isOpen = ref<boolean>(false)
-const shouldFocusInput = ref<boolean>(false)
+// Keyboard focus: the panel, and the launcher focus returns to when the panel closes.
+const panelRef = ref<HTMLElement | null>(null)
+const fabRef = ref<{ $el: HTMLElement } | null>(null)
+const panelId = uniqueId('ci-widget-panel')
 const currentView = ref<'home' | 'chat'>('home')
 const realtimeVoiceModeOpen = ref(false)
 const realtimeUserHasSpoken = ref(false)
@@ -113,14 +109,19 @@ const openRequestToken = ref(0)
 const isHelloBubbleVisible = ref(false)
 const helloBubbleText = ref('')
 const helloBubbleTimeoutId = ref<number | null>(null)
-const HELLO_BUBBLE_STORAGE_KEY = 'clearideas_hello_bubble_shown'
 
 // Disclaimer dialog state
 const showDisclaimerDialog = ref<boolean>(false)
 const disclaimerDialogScrolledToBottom = ref<boolean>(false)
 const disclaimerDialogHasScrolled = ref<boolean>(false)
 const disclaimerDialogContentRef = ref<HTMLElement | null>(null)
-const DISCLAIMER_DIALOG_STORAGE_KEY = 'clearideas_disclaimer_dialog_dismissed'
+const disclaimerDialogVisible = computed(
+  () =>
+    showDisclaimerDialog.value &&
+    !!initData.value?.disclaimerDialogEnabled &&
+    !!initData.value?.disclaimerDialogText &&
+    currentView.value === 'chat',
+)
 
 /**
  * Helper function to resolve a consent prop value (supports boolean, function, or string)
@@ -190,6 +191,35 @@ const actionsOverride = ref<WidgetAction[] | undefined>(undefined)
 const userNameOverride = ref<string | undefined>(undefined)
 const userEmailOverride = ref<string | undefined>(undefined)
 const userIdOverride = ref<string | undefined>(undefined)
+
+/** The site's ID for the signed-in visitor (userId option or setUserId()), or null. */
+const currentUserId = computed(() => {
+  const value = userIdOverride.value !== undefined ? userIdOverride.value : props.userId
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+})
+
+const USER_ID_HEADER = 'x-clearideas-public-chat-user-id'
+const MAX_USER_ID_LENGTH = 256
+let warnedUserId: string | null = null
+
+/**
+ * Header identifying the signed-in user (protocol README §5.5). The value is percent-encoded, since
+ * header values must be ASCII; an over-long ID is not sent.
+ */
+function userIdHeaders(): Record<string, string> {
+  const userId = currentUserId.value
+  if (!userId) return {}
+  if (userId.length > MAX_USER_ID_LENGTH) {
+    if (warnedUserId !== userId) {
+      console.warn(
+        `[ClearIdeasWidget] userId is longer than ${MAX_USER_ID_LENGTH} characters and is not sent.`,
+      )
+      warnedUserId = userId
+    }
+    return {}
+  }
+  return { [USER_ID_HEADER]: encodeURIComponent(userId) }
+}
 const localeOverride = ref<string | undefined>(undefined)
 
 const resolvedLocale = computed(() => localeOverride.value ?? props.locale)
@@ -229,56 +259,44 @@ const consentStatus = computed<'granted' | 'not-required' | 'pending'>(() => {
   return 'pending'
 })
 
-// Helper function to get the appropriate storage based on consent state
-function getStorage(): Storage {
-  if (typeof window === 'undefined') {
-    // Fallback for SSR - return a mock storage that properly implements Storage interface
-    // Use an in-memory storage object for SSR
-    const storage: Record<string, string> = {}
-    return {
-      getItem: (key: string) => storage[key] || null,
-      setItem: (key: string, value: string) => {
-        storage[key] = value
-      },
-      removeItem: (key: string) => {
-        delete storage[key]
-      },
-      clear: () => {
-        Object.keys(storage).forEach(key => delete storage[key])
-      },
-      get length() {
-        return Object.keys(storage).length
-      },
-      key: (index: number) => {
-        const keys = Object.keys(storage)
-        return keys[index] || null
-      },
-    } as Storage
-  }
-  return shouldUsePersistentStorage.value ? localStorage : sessionStorage
+// Browser storage, namespaced per server and site (utils/storage.ts). localStorage is used only
+// when consent is not required or has been granted; otherwise sessionStorage.
+function storageKeyFor(name: StorageKeyName): string {
+  return storageKey(
+    name,
+    storageNamespace(apiUrl.value, props.accessKey ?? '', currentUserId.value),
+  )
 }
 
-// Helper function to get sessionId from storage, respecting consent state
-function getStoredSessionId(): string | null {
-  if (typeof window === 'undefined') {
-    return null
-  }
-  // Respect consent state: use appropriate storage based on shouldUsePersistentStorage
+function activeStorage(): Storage | null {
+  return getBrowserStorage(shouldUsePersistentStorage.value ? 'local' : 'session')
+}
+
+function readStored(name: StorageKeyName): string | null {
+  const key = storageKeyFor(name)
   if (shouldUsePersistentStorage.value) {
-    // Prefer localStorage, fallback to sessionStorage
-    const fromLocalStorage = localStorage.getItem('clearideasPublicChatSessionId')
-    if (fromLocalStorage) {
-      return fromLocalStorage
-    }
-    return sessionStorage.getItem('clearideasPublicChatSessionId')
-  } else {
-    // Consent not granted: only use sessionStorage, ignore localStorage
-    return sessionStorage.getItem('clearideasPublicChatSessionId')
+    return readItem(getBrowserStorage('local'), key) ?? readItem(getBrowserStorage('session'), key)
   }
+  return readItem(getBrowserStorage('session'), key)
 }
 
-// Cache key for init data in sessionStorage
-const INIT_DATA_CACHE_KEY = 'clearideasPublicChatInitData'
+function writeStored(name: StorageKeyName, value: string): void {
+  writeItem(activeStorage(), storageKeyFor(name), value)
+}
+
+function removeStored(name: StorageKeyName): void {
+  removeItem(getBrowserStorage('local'), storageKeyFor(name))
+  removeItem(getBrowserStorage('session'), storageKeyFor(name))
+}
+
+function getStoredSessionId(): string | null {
+  return readStored('session')
+}
+
+function storeSessionId(id: string): void {
+  writeStored('session', id)
+}
+
 const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
 
 interface CachedInitData {
@@ -289,114 +307,84 @@ interface CachedInitData {
   sessionId?: string
 }
 
-// Get cached init data from storage (checks both localStorage and sessionStorage)
-// This ensures cache hits even if consent state changed between cache write and read
-function getCachedInitData(): CachedInitData | null {
-  if (typeof window === 'undefined') {
-    return null
+/**
+ * Server configuration is untrusted (protocol README §7.1): keep only http(s) icon and link URLs,
+ * a valid color, a known theme mode and a sane bubble delay.
+ */
+function sanitizeInitData(data: InitResponse): InitResponse {
+  const color = safeColor(data.style?.color)
+  const mode = data.style?.mode
+  const links = Array.isArray(data.links) ? data.links : []
+  const delay = data.helloBubbleDelay
+  return {
+    ...data,
+    style: {
+      ...(color ? { color } : {}),
+      ...(mode === 'light' || mode === 'dark' || mode === 'system' ? { mode } : {}),
+    },
+    iconUrl: safeWebUrl(data.iconUrl) ?? undefined,
+    links: links
+      .filter(link => link && typeof link.title === 'string' && safeWebUrl(link.url))
+      .slice(0, 4)
+      .map(link => ({ ...link, url: safeWebUrl(link.url)! })),
+    helloBubbleDelay:
+      typeof delay === 'number' && Number.isFinite(delay) && delay >= 0
+        ? Math.min(delay, 600)
+        : undefined,
   }
+}
+
+// Cached init data is read from either storage so a cache written before a consent change still
+// counts.
+function getCachedInitData(): CachedInitData | null {
+  const key = storageKeyFor('initCache')
+  const raw =
+    readItem(getBrowserStorage('local'), key) ?? readItem(getBrowserStorage('session'), key)
+  if (!raw) return null
   try {
-    // First check current storage (based on consent state)
-    const storage = getStorage()
-    let cached = storage.getItem(INIT_DATA_CACHE_KEY)
-    if (cached) {
-      return JSON.parse(cached) as CachedInitData
-    }
-    // If not found in current storage, check the other storage
-    // This handles cases where consent state changed after caching
-    const otherStorage = storage === localStorage ? sessionStorage : localStorage
-    cached = otherStorage.getItem(INIT_DATA_CACHE_KEY)
-    if (cached) {
-      debugLog('[ClearIdeasWidget] Found cached init data in alternate storage')
-      return JSON.parse(cached) as CachedInitData
-    }
-    return null
+    const cached = JSON.parse(raw) as CachedInitData
+    if (!cached || typeof cached !== 'object' || !cached.data) return null
+    return { ...cached, data: sanitizeInitData(cached.data) }
   } catch (err) {
     debugLog('[ClearIdeasWidget] Failed to parse cached init data:', err)
     return null
   }
 }
 
-// Store init data in storage (respects consent state) with timestamp and consent status
 function setCachedInitData(data: InitResponse): void {
-  if (typeof window === 'undefined') {
-    return
+  const cachedSessionId = sessionId.value || getStoredSessionId() || undefined
+  const cached: CachedInitData = {
+    data,
+    timestamp: new Date().toISOString(),
+    consentStatus: consentStatus.value,
+    locale: widgetLocale.value,
+    ...(cachedSessionId ? { sessionId: cachedSessionId } : {}),
   }
-  try {
-    const cachedSessionId = sessionId.value || getStoredSessionId() || undefined
-    const cached: CachedInitData = {
-      data,
-      timestamp: new Date().toISOString(),
-      consentStatus: consentStatus.value,
-      locale: widgetLocale.value,
-      ...(cachedSessionId ? { sessionId: cachedSessionId } : {}),
-    }
-    const storage = getStorage()
-    storage.setItem(INIT_DATA_CACHE_KEY, JSON.stringify(cached))
-    debugLog(
-      `[ClearIdeasWidget] Cached init data in ${shouldUsePersistentStorage.value ? 'localStorage' : 'sessionStorage'}`,
-    )
-  } catch (err) {
-    // Handle storage quota errors gracefully (fallback to API call)
-    debugWarn('[ClearIdeasWidget] Failed to cache init data (storage quota exceeded?):', err)
-  }
+  writeStored('initCache', JSON.stringify(cached))
 }
 
 // Check if cached data is stale (>5 minutes old)
 function isCachedDataStale(cached: CachedInitData): boolean {
-  try {
-    const cachedTime = new Date(cached.timestamp).getTime()
-    // Explicitly check for invalid timestamp - NaN indicates invalid date
-    if (isNaN(cachedTime)) {
-      debugLog('[ClearIdeasWidget] Invalid timestamp in cache, treating as stale')
-      return true
-    }
-    const now = Date.now()
-    const age = now - cachedTime
-    return age > CACHE_TTL_MS
-  } catch (err) {
-    debugLog('[ClearIdeasWidget] Failed to check cache staleness:', err)
-    return true // Consider stale if we can't parse timestamp
-  }
+  const cachedTime = new Date(cached.timestamp).getTime()
+  return Number.isNaN(cachedTime) || Date.now() - cachedTime > CACHE_TTL_MS
 }
 
-// Clear cached init data from storage (checks both localStorage and sessionStorage)
 function clearCachedInitData(): void {
-  if (typeof window === 'undefined') {
-    return
-  }
-  try {
-    // Clear from both storages to handle consent state changes
-    localStorage.removeItem(INIT_DATA_CACHE_KEY)
-    sessionStorage.removeItem(INIT_DATA_CACHE_KEY)
-    debugLog('[ClearIdeasWidget] Cleared cached init data')
-  } catch (err) {
-    debugWarn('[ClearIdeasWidget] Failed to clear cached init data:', err)
-  }
+  removeStored('initCache')
 }
 
 function clearStoredSessionId(): void {
-  if (typeof window === 'undefined') {
-    return
-  }
-
-  try {
-    localStorage.removeItem('clearideasPublicChatSessionId')
-    sessionStorage.removeItem('clearideasPublicChatSessionId')
-    debugLog('[ClearIdeasWidget] Cleared stored session ID')
-  } catch (err) {
-    debugWarn('[ClearIdeasWidget] Failed to clear stored session ID:', err)
-  }
+  removeStored('session')
 }
 
-function resetChatStateForLocaleChange() {
+/** Clears the conversation, for a new language or a different signed-in user. */
+function resetChatState() {
   if (abortController.value) {
     abortController.value.abort()
     abortController.value = null
   }
 
   stopAllAudio()
-  audioBtnRefs.value.clear()
   messageAudioState.value.clear()
   sessionId.value = null
   chatId.value = null
@@ -445,63 +433,47 @@ function applyExistingChat(existingChat?: SessionActivationResponse['existingCha
   isNewChat.value = false
 }
 
-// Detect dark mode (checks multiple sources: prop, server init data, parent page, system preference)
-// Uses computed to automatically track reactivity - if prop is a function that accesses refs/computed,
-// Vue will track those dependencies automatically
+// Dark mode, in order of precedence: setDarkMode(), the darkMode prop, the server's theme mode
+// (dark or light), the page's theme markup (class "dark"/"light", data-theme, data-bs-theme on
+// <html> or <body>), then the system preference (server mode "system" or none). Page markup and the
+// system preference are observed (utils/page-theme.ts), so the widget follows theme switches live;
+// a darkMode function or global is read again whenever the page theme changes.
 const isDarkMode = computed(() => {
-  // Check internal override first (set via setDarkMode method)
-  if (darkModeOverride.value !== undefined) {
-    return darkModeOverride.value
-  }
+  const page = currentPageTheme.value
 
-  // Check prop (supports boolean, function, or string)
-  // Vue automatically tracks reactivity when function/computed is called within computed
+  if (darkModeOverride.value !== undefined) return darkModeOverride.value
+
   if (props.darkMode !== undefined) {
-    if (typeof props.darkMode === 'boolean') {
-      return props.darkMode
-    }
-    if (typeof props.darkMode === 'function') {
-      // Vue will track any refs/computed accessed inside this function
-      return props.darkMode()
-    }
-    if (typeof props.darkMode === 'string') {
-      // For string props (global variables), we need to check if it's a ref/computed
-      // Otherwise fall back to direct access (not reactive, but efficient)
-      if (typeof window !== 'undefined') {
-        const globalValue = (window as any)[props.darkMode]
-        if (typeof globalValue === 'function') {
-          return globalValue()
-        }
-        // If it's a ref/computed, Vue will track it when we access .value
-        if (globalValue && typeof globalValue === 'object' && 'value' in globalValue) {
-          return Boolean(globalValue.value)
-        }
-        return Boolean(globalValue)
+    if (typeof props.darkMode === 'boolean') return props.darkMode
+    if (typeof props.darkMode === 'function') return Boolean(props.darkMode())
+    if (typeof props.darkMode === 'string' && typeof window !== 'undefined') {
+      // Name of a global: a boolean, a function, or a Vue ref.
+      const globalValue = (window as any)[props.darkMode]
+      if (typeof globalValue === 'function') return Boolean(globalValue())
+      if (globalValue && typeof globalValue === 'object' && 'value' in globalValue) {
+        return Boolean(globalValue.value)
       }
+      return Boolean(globalValue)
     }
   }
 
-  // Check server init data
-  if (initData.value?.style?.mode === 'dark') return true
-  if (initData.value?.style?.mode === 'light') return false
-
-  // Check system preference or parent theme
-  if (typeof window !== 'undefined') {
-    const root = document.documentElement
-    const hasDarkTheme =
-      root.hasAttribute('data-theme') && root.getAttribute('data-theme') === 'dark'
-    const hasDarkClass = root.classList.contains('dark')
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-
-    return hasDarkTheme || hasDarkClass || (initData.value?.style?.mode === 'system' && prefersDark)
-  }
-  return false
+  const mode = initData.value?.style?.mode
+  if (mode === 'dark') return true
+  if (mode === 'light') return false
+  // "system", also when the server sends no mode (the protocol default).
+  if (page.marker) return page.marker === 'dark'
+  return page.prefersDark
 })
 
 // Streaming state
 const streamingContent = ref<string>('')
 const streamingAssistantIndex = ref<number>(-1)
 const abortController = ref<AbortController | null>(null)
+// Configuration (/init) and session (/session) requests: a newer request aborts and supersedes the
+// one in flight, and both are aborted on unmount, so a late response never overwrites newer state.
+let initRequest: AbortController | null = null
+let sessionRequest: AbortController | null = null
+let unmounted = false
 
 // Chat input state (inlined from ConsumerChatInput)
 const chatInputContent = ref<string>('')
@@ -572,17 +544,24 @@ const {
   async (audioBase64: string, format: string) => {
     await sendVoiceMessage(audioBase64, format)
   },
-  (errorMsg: string) => {
-    error.value = errorMsg
+  (kind: VoiceErrorKind) => {
+    error.value = t(VOICE_ERROR_KEYS[kind])
   },
   waveformBars,
 )
 
 // Markdown formatting is now in utils/markdown.ts
 
+// Accent used when neither the server nor the host page sets one.
+const DEFAULT_ACCENT = '#ED613F'
+
 // Get API base URL - use prop if provided, otherwise use default from Vite env
 // VITE_API_BASE_URL is replaced at build time via vite.config.ts define option
-const DEFAULT_API_BASE_URL = __VITE_API_BASE_URL__ || 'https://api.clearideas.com'
+// The constant is defined by this package's build; the guard keeps the .vue source usable in other
+// builds that do not define it.
+const DEFAULT_API_BASE_URL =
+  (typeof __VITE_API_BASE_URL__ !== 'undefined' ? __VITE_API_BASE_URL__ : '') ||
+  'https://api.clearideas.com'
 
 const apiUrl = computed(() => {
   const base = props.apiBaseUrl || DEFAULT_API_BASE_URL
@@ -617,6 +596,7 @@ const {
   publicSessionId: sessionId,
   locale: widgetLocale,
   includeCredentials: shouldIncludeCredentials,
+  extraHeaders: userIdHeaders,
   waveformBars,
   onChatId: id => {
     chatId.value = id
@@ -656,13 +636,16 @@ const {
     streamingAssistantIndex.value = -1
     streamingContent.value = ''
   },
-  onError: message => {
-    error.value = message
+  onError: (kind, detail) => {
+    console.warn('[ClearIdeasWidget] Voice session error:', detail)
+    error.value = t(VOICE_ERROR_KEYS[kind])
   },
 })
 
 const supportsAnyVoice = computed(() => supportsRealtimeVoice.value || supportsVoiceRecording.value)
 const voiceInputActive = computed(() => realtimeVoiceActive.value || isRecording.value)
+// A reply is being requested or streamed (typing indicator, busy conversation log).
+const replyInProgress = computed(() => loading.value || streamingAssistantIndex.value >= 0)
 const voiceInputDuration = computed(() =>
   realtimeVoiceActive.value ? realtimeRecordingDuration.value : recordingDuration.value,
 )
@@ -685,16 +668,23 @@ const widgetColor = computed(() => {
   if (initData.value?.style?.color) {
     return initData.value.style.color
   }
+  // A host page can set a default accent on its root element:
+  //   :root { --ci-widget-accent: #2866cf }   (or the legacy --ci-widget-feature: 40, 102, 207)
   if (typeof window !== 'undefined' && document?.documentElement) {
-    const cssValue = getComputedStyle(document.documentElement)
-      .getPropertyValue('--ci-widget-feature')
-      .trim()
-    if (cssValue) {
-      return cssValue.includes(',') ? `rgb(${cssValue})` : cssValue
-    }
+    const rootStyle = getComputedStyle(document.documentElement)
+    const accentVar = safeColor(rootStyle.getPropertyValue('--ci-widget-accent').trim())
+    if (accentVar) return accentVar
+    const legacy = rootStyle.getPropertyValue('--ci-widget-feature').trim()
+    const legacyColor = safeColor(legacy.includes(',') ? `rgb(${legacy})` : legacy)
+    if (legacyColor) return legacyColor
   }
-  return '#ED613F'
+  return DEFAULT_ACCENT
 })
+
+// Accent palette (utils/color.ts). Styles read it from CSS variables on the widget root, so every
+// accent-colored element follows the site color.
+const accent = computed(() => accentPalette(widgetColor.value, DEFAULT_ACCENT))
+const accentStyle = computed(() => accentVariables(accent.value, isDarkMode.value))
 
 const widgetLinks = computed(() => {
   // If actionsOverride is set, use that (set via setActions() method)
@@ -707,9 +697,9 @@ const widgetLinks = computed(() => {
   const chatAction: WidgetAction = {
     id: 'chat',
     title: initData.value?.chatName
-      ? `Chat with ${initData.value.chatName}`
-      : 'Chat with AI Assistant',
-    description: initData.value?.chatTagline || 'Ask questions and get help',
+      ? t('home.chatWith', { name: initData.value.chatName })
+      : t('home.chatDefaultTitle'),
+    description: initData.value?.chatTagline || t('home.chatDefaultDescription'),
     type: 'chat',
     icon: 'sparkles',
   }
@@ -734,141 +724,14 @@ const widgetLinks = computed(() => {
 })
 
 const widgetChatName = computed(() => {
-  return initData.value?.chatName || chatName.value || 'Clear Ideas™ Assistant'
+  return initData.value?.chatName || chatName.value || t('chat.defaultName')
 })
 
-// Helper to adjust color lightness
-function adjustColorLightness(color: string, amount: number): string {
-  if (color.startsWith('rgb')) {
-    const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/)
-    if (match) {
-      const r = Math.max(0, Math.min(255, parseInt(match[1]) + amount))
-      const g = Math.max(0, Math.min(255, parseInt(match[2]) + amount))
-      const b = Math.max(0, Math.min(255, parseInt(match[3]) + amount))
-      return `rgb(${r}, ${g}, ${b})`
-    }
-  }
-  if (color.startsWith('#')) {
-    const cleanHex = color.replace('#', '')
-    const r = parseInt(
-      cleanHex.length === 3 ? cleanHex[0] + cleanHex[0] : cleanHex.substring(0, 2),
-      16,
-    )
-    const g = parseInt(
-      cleanHex.length === 3 ? cleanHex[1] + cleanHex[1] : cleanHex.substring(2, 4),
-      16,
-    )
-    const b = parseInt(
-      cleanHex.length === 3 ? cleanHex[2] + cleanHex[2] : cleanHex.substring(4, 6),
-      16,
-    )
-    const newR = Math.max(0, Math.min(255, r + amount))
-    const newG = Math.max(0, Math.min(255, g + amount))
-    const newB = Math.max(0, Math.min(255, b + amount))
-    return `rgb(${newR}, ${newG}, ${newB})`
-  }
-  return color
-}
-
-const widgetColorLight = computed(() => adjustColorLightness(widgetColor.value, 30))
-const widgetColorDark = computed(() => adjustColorLightness(widgetColor.value, -20))
-const widgetColorBase = computed(() => {
-  const color = widgetColor.value
-  if (color.startsWith('rgb')) {
-    const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/)
-    if (match) {
-      return `rgb(${match[1]}, ${match[2]}, ${match[3]})`
-    }
-  }
-  if (color.startsWith('#')) {
-    const cleanHex = color.replace('#', '')
-    const r = parseInt(
-      cleanHex.length === 3 ? cleanHex[0] + cleanHex[0] : cleanHex.substring(0, 2),
-      16,
-    )
-    const g = parseInt(
-      cleanHex.length === 3 ? cleanHex[1] + cleanHex[1] : cleanHex.substring(2, 4),
-      16,
-    )
-    const b = parseInt(
-      cleanHex.length === 3 ? cleanHex[2] + cleanHex[2] : cleanHex.substring(4, 6),
-      16,
-    )
-    return `rgb(${r}, ${g}, ${b})`
-  }
-  return color
-})
-
-// Calculate relative luminance for contrast calculation
-function getLuminance(r: number, g: number, b: number): number {
-  const [rs, gs, bs] = [r, g, b].map(val => {
-    val = val / 255
-    return val <= 0.03928 ? val / 12.92 : Math.pow((val + 0.055) / 1.055, 2.4)
-  })
-  return 0.2126 * rs + 0.7152 * gs + 0.0722 * bs
-}
-
-// Get RGB values from color string
-function getRgbFromColor(color: string): { r: number; g: number; b: number } | null {
-  if (color.startsWith('rgb')) {
-    const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/)
-    if (match) {
-      return {
-        r: parseInt(match[1]),
-        g: parseInt(match[2]),
-        b: parseInt(match[3]),
-      }
-    }
-  }
-  if (color.startsWith('#')) {
-    const cleanHex = color.replace('#', '')
-    const r = parseInt(
-      cleanHex.length === 3 ? cleanHex[0] + cleanHex[0] : cleanHex.substring(0, 2),
-      16,
-    )
-    const g = parseInt(
-      cleanHex.length === 3 ? cleanHex[1] + cleanHex[1] : cleanHex.substring(2, 4),
-      16,
-    )
-    const b = parseInt(
-      cleanHex.length === 3 ? cleanHex[2] + cleanHex[2] : cleanHex.substring(4, 6),
-      16,
-    )
-    return { r, g, b }
-  }
-  return null
-}
-
-// Convert hex color to rgba string
-function hexToRgba(hex: string, alpha: number): string {
-  // Remove # if present
-  const cleanHex = hex.replace('#', '')
-
-  // Handle 3-digit hex
-  if (cleanHex.length === 3) {
-    const r = parseInt(cleanHex[0] + cleanHex[0], 16)
-    const g = parseInt(cleanHex[1] + cleanHex[1], 16)
-    const b = parseInt(cleanHex[2] + cleanHex[2], 16)
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`
-  }
-
-  // Handle 6-digit hex
-  const r = parseInt(cleanHex.substring(0, 2), 16)
-  const g = parseInt(cleanHex.substring(2, 4), 16)
-  const b = parseInt(cleanHex.substring(4, 6), 16)
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`
-}
-
-// Determine if we should use white or black text based on background color contrast
-const headerContrastColor = computed(() => {
-  const rgb = getRgbFromColor(widgetColorBase.value)
-  if (!rgb) {
-    return 'rgb(33, 33, 33)' // Default to dark text
-  }
-  const luminance = getLuminance(rgb.r, rgb.g, rgb.b)
-  // If luminance is above 0.5, use black text, otherwise use white
-  return luminance > 0.5 ? 'rgb(33, 33, 33)' : 'rgb(255, 255, 255)'
-})
+const widgetColorBase = computed(() => accent.value.base)
+const widgetColorLight = computed(() => accent.value.soft)
+const widgetColorDark = computed(() => accent.value.strong)
+// Text and icons on the accent color (white or near-black, whichever contrasts more).
+const headerContrastColor = computed(() => accent.value.onAccent)
 
 // Audio context - needs to be created after user interaction
 let audioContext: AudioContext | null = null
@@ -895,26 +758,44 @@ function initAudioContextOnInteraction() {
   if (audioContextInitialized) return
 
   const events = ['click', 'touchstart', 'keydown']
-  const initOnce = () => {
-    initAudioContext()
-    // Remove listeners after first interaction
+  const removeListeners = () => {
     events.forEach(event => {
       document.removeEventListener(event, initOnce, { capture: true })
     })
+    removeInteractionListeners = null
+  }
+  const initOnce = () => {
+    initAudioContext()
+    removeListeners() // only the first interaction matters
   }
 
   events.forEach(event => {
-    document.addEventListener(event, initOnce, { capture: true, once: true })
+    document.addEventListener(event, initOnce, { capture: true })
   })
+  removeInteractionListeners = removeListeners
+}
+
+// This instance's page listeners and timers, released on unmount.
+let removeInteractionListeners: (() => void) | null = null
+const pendingTimers = new Set<number>()
+
+function later(callback: () => void, ms: number): number {
+  const id = window.setTimeout(() => {
+    pendingTimers.delete(id)
+    callback()
+  }, ms)
+  pendingTimers.add(id)
+  return id
 }
 
 // Play a pleasant notification sound using Web Audio API
 async function playHelloBubbleSound() {
   try {
-    // Initialize audio context if not already created
-    const ctx = initAudioContext()
+    // Browsers only allow audio after the visitor interacts with the page, and warn about an
+    // AudioContext created earlier. The context exists once the visitor has clicked or typed.
+    const ctx = audioContext
     if (!ctx) {
-      debugLog('[ClearIdeasWidget] Audio context not available')
+      debugLog('[ClearIdeasWidget] No page interaction yet; hello bubble sound skipped')
       return
     }
 
@@ -966,30 +847,17 @@ async function playHelloBubbleSound() {
   }
 }
 
-// Check if hello bubble was already shown
 function hasHelloBubbleBeenShown(): boolean {
-  try {
-    const storage = getStorage()
-    return storage.getItem(HELLO_BUBBLE_STORAGE_KEY) === 'true'
-  } catch (err) {
-    debugWarn('[ClearIdeasWidget] Failed to check hello bubble shown status:', err)
-    return false
-  }
+  return readStored('helloBubbleShown') === 'true'
 }
 
-// Mark hello bubble as shown
 function markHelloBubbleAsShown() {
-  try {
-    const storage = getStorage()
-    storage.setItem(HELLO_BUBBLE_STORAGE_KEY, 'true')
-  } catch (err) {
-    debugWarn('[ClearIdeasWidget] Failed to mark hello bubble as shown:', err)
-  }
+  writeStored('helloBubbleShown', 'true')
 }
 
 // Show hello bubble on FAB
 function showHelloBubble() {
-  if (!fabBtnRef.value || !initData.value) {
+  if (!launcherShown.value || !initData.value) {
     debugLog('[ClearIdeasWidget] Hello bubble: FAB or initData not available')
     return
   }
@@ -1029,7 +897,7 @@ function showHelloBubble() {
 
   // Set timeout to show bubble after delay
   helloBubbleTimeoutId.value = window.setTimeout(() => {
-    if (!fabBtnRef.value || !initData.value) return
+    if (!launcherShown.value || !initData.value) return
 
     // Check again if already shown (in case user interacted while waiting)
     if (hasHelloBubbleBeenShown()) {
@@ -1054,9 +922,7 @@ function showHelloBubble() {
     markHelloBubbleAsShown()
 
     // Auto-hide after 15 seconds
-    setTimeout(() => {
-      hideHelloBubble()
-    }, 15000)
+    later(hideHelloBubble, 15000)
   }, delay)
 }
 
@@ -1069,32 +935,19 @@ function hideHelloBubble() {
     helloBubbleTimeoutId.value = null
   }
   // Clear text after animation completes
-  setTimeout(() => {
+  later(() => {
     if (!isHelloBubbleVisible.value) {
       helloBubbleText.value = ''
     }
   }, 300)
 }
 
-// Check if disclaimer dialog was already dismissed
 function hasDisclaimerDialogBeenDismissed(): boolean {
-  try {
-    const storage = getStorage()
-    return storage.getItem(DISCLAIMER_DIALOG_STORAGE_KEY) === 'true'
-  } catch (err) {
-    debugWarn('[ClearIdeasWidget] Failed to check disclaimer dialog dismissed status:', err)
-    return false
-  }
+  return readStored('disclaimerDismissed') === 'true'
 }
 
-// Mark disclaimer dialog as dismissed
 function markDisclaimerDialogAsDismissed() {
-  try {
-    const storage = getStorage()
-    storage.setItem(DISCLAIMER_DIALOG_STORAGE_KEY, 'true')
-  } catch (err) {
-    debugWarn('[ClearIdeasWidget] Failed to mark disclaimer dialog as dismissed:', err)
-  }
+  writeStored('disclaimerDismissed', 'true')
 }
 
 // Show disclaimer dialog if enabled and not already dismissed
@@ -1119,9 +972,10 @@ function checkAndShowDisclaimerDialog() {
 
   // Show dialog
   showDisclaimerDialog.value = true
-  // Check scroll position after dialog is rendered
+  // Check scroll position after dialog is rendered, and move focus into it
   nextTick(() => {
     checkDisclaimerDialogScroll()
+    disclaimerDialogContentRef.value?.focus()
   })
 }
 
@@ -1132,6 +986,7 @@ function dismissDisclaimerDialog() {
   // Reset scroll state
   disclaimerDialogScrolledToBottom.value = false
   disclaimerDialogHasScrolled.value = false
+  focusPanel() // back to the text box
 }
 
 // Check if disclaimer dialog content is scrolled to bottom
@@ -1149,409 +1004,109 @@ function checkDisclaimerDialogScroll() {
   disclaimerDialogScrolledToBottom.value = isAtBottom
 }
 
-// Load initialization data from API
+// Load widget configuration (GET /public/chat/init), from a fresh cache when possible.
 async function loadInitData() {
   if (!apiUrl.value || !props.accessKey) {
     console.warn('[ClearIdeasWidget] Cannot load init data: missing apiUrl or accessKey')
     return
   }
 
-  // Always log that we're starting (so user knows widget is loading)
-  console.log(
-    '[ClearIdeasWidget] loadInitData() called - set window.__ClearIdeasWidgetDebug = true for detailed logs',
-  )
-  // Always log consent state - critical for debugging authenticated vs anonymous
-  console.log('[ClearIdeasWidget] loadInitData() called with consent state', {
-    consentRequired: resolvedConsentRequired.value,
-    consentGranted: resolvedConsentGranted.value,
-    consentStatus: consentStatus.value,
-    shouldIncludeCredentials: shouldIncludeCredentials.value,
-    shouldUsePersistentStorage: shouldUsePersistentStorage.value,
-  })
-  debugLog('[ClearIdeasWidget] loadInitData() called', {
-    apiUrl: apiUrl.value,
-    hasAccessKey: !!props.accessKey,
-    currentInitData: initData.value ? 'exists' : 'null',
-    sessionId: sessionId.value,
-  })
+  initRequest?.abort()
+  const request = new AbortController()
+  initRequest = request
+  const isCurrent = () => initRequest === request && !unmounted
 
   loadingInit.value = true
   try {
-    // Check for existing session ID in both localStorage and sessionStorage
     const storedSessionId = getStoredSessionId()
-    if (storedSessionId) {
-      sessionId.value = storedSessionId
-      debugLog('[ClearIdeasWidget] Restored session ID from storage:', storedSessionId)
-    }
+    if (storedSessionId) sessionId.value = storedSessionId
 
-    // Check for cached init data before making API call
     const cached = getCachedInitData()
     if (cached) {
-      // Validate cache: check if consent status matches and data is not stale
-      const consentMatches = cached.consentStatus === consentStatus.value
-      const localeMatches = cached.locale === widgetLocale.value
-      const isStale = isCachedDataStale(cached)
-
-      if (consentMatches && localeMatches && !isStale) {
-        // Cache is valid - use cached data
-        debugLog('[ClearIdeasWidget] Using cached init data', {
-          age: Date.now() - new Date(cached.timestamp).getTime(),
-          consentStatus: cached.consentStatus,
-          locale: cached.locale,
-        })
-        console.log('[ClearIdeasWidget] Using cached init data (skipping API call)')
-        initData.value = cached.data
+      const usable =
+        cached.consentStatus === consentStatus.value &&
+        cached.locale === widgetLocale.value &&
+        !isCachedDataStale(cached)
+      if (usable) {
+        debugLog('[ClearIdeasWidget] Using cached init data')
+        applyInitData(cached.data)
         if (!sessionId.value && cached.sessionId) {
           sessionId.value = cached.sessionId
-          try {
-            const storage = getStorage()
-            storage.setItem('clearideasPublicChatSessionId', cached.sessionId)
-          } catch (err) {
-            debugWarn('[ClearIdeasWidget] Failed to persist cached session ID:', err)
-          }
+          storeSessionId(cached.sessionId)
         }
-
-        // Process cached data same as API response
-        if (cached.data.chatName) {
-          chatName.value = cached.data.chatName
-        }
-        isNewChat.value = true
-
-        loadingInit.value = false
-        console.log('[ClearIdeasWidget] loadInitData() completed successfully (from cache)')
-        debugLog('[ClearIdeasWidget] loadInitData() completed successfully (from cache)')
-
-        // Trigger hello bubble if enabled (after nextTick to ensure FAB is mounted)
-        // The bubble's own localStorage key controls whether it's shown, independent of init cache
-        nextTick(() => {
-          showHelloBubble()
-        })
-
         return
-      } else {
-        // Cache invalid - clear it and fetch fresh data
-        debugLog('[ClearIdeasWidget] Cache invalid', {
-          consentMatches,
-          localeMatches,
-          isStale,
-          cachedConsentStatus: cached.consentStatus,
-          cachedLocale: cached.locale,
-          currentLocale: widgetLocale.value,
-          currentConsentStatus: consentStatus.value,
-        })
-        clearCachedInitData()
       }
+      clearCachedInitData()
     }
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${props.accessKey}`,
       'Accept-Language': widgetLocale.value,
+      ...userIdHeaders(),
       'x-clearideas-public-chat-consent-status': consentStatus.value,
     }
+    if (sessionId.value) headers['x-clearideas-public-chat-session'] = sessionId.value
 
-    // CRITICAL: Always include session ID if available (for session continuity)
-    if (sessionId.value) {
-      headers['x-clearideas-public-chat-session'] = sessionId.value
-    }
-
-    // Always log request details
-    console.log('[ClearIdeasWidget] Fetching /init with headers:', {
-      hasSessionId: !!headers['x-clearideas-public-chat-session'],
-      consentStatus: headers['x-clearideas-public-chat-consent-status'],
-      credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-    })
-    debugLog('[ClearIdeasWidget] Fetching /init with headers:', {
-      hasSessionId: !!headers['x-clearideas-public-chat-session'],
-      consentStatus: headers['x-clearideas-public-chat-consent-status'],
-    })
-
-    // Use cache: "no-store" to bypass all caches and force a fresh request
-    // This prevents 304 responses that might have empty bodies and cause initialization issues
-    // When init() is called again (e.g., after login), the component is destroyed and recreated,
-    // so we want fresh data, not cached responses
     const response = await fetch(`${apiUrl.value}/public/chat/init`, {
       method: 'GET',
       headers,
       credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-      cache: 'no-store', // Bypass cache entirely to ensure fresh response with body
+      cache: 'no-store',
+      signal: request.signal,
     })
+    if (!isCurrent()) return
 
-    // Extract headers for logging
-    const responseHeaders: Record<string, string> = {}
-    response.headers.forEach((value, key) => {
-      responseHeaders[key] = value
-    })
-    // Always log response details - critical for debugging init issues
-    console.log('[ClearIdeasWidget] /init response received', {
-      status: response.status,
-      statusText: response.statusText,
-      ok: response.ok,
-      headers: responseHeaders,
-    })
-    debugLog('[ClearIdeasWidget] /init response received', {
-      status: response.status,
-      statusText: response.statusText,
-      ok: response.ok,
-      headers: responseHeaders,
-    })
-
-    // Handle 304 Not Modified responses first - these typically have no body
-    // With cache: 'no-store', 304 should be rare, but handle it as a safety net
-    if (response.status === 304) {
-      console.warn(
-        '[ClearIdeasWidget] Received 304 Not Modified response (unexpected with cache: no-store)',
-      )
-      // For 304, check if we have valid cached data first before attempting to parse body
-      const cached = getCachedInitData()
-      if (cached) {
-        const consentMatches = cached.consentStatus === consentStatus.value
-        const localeMatches = cached.locale === widgetLocale.value
-        const isStale = isCachedDataStale(cached)
-        if (consentMatches && localeMatches && !isStale) {
-          // Use cached data - 304 means nothing changed
-          debugLog('[ClearIdeasWidget] Using cached data for 304 response')
-          initData.value = cached.data
-          if (!sessionId.value && cached.sessionId) {
-            sessionId.value = cached.sessionId
-            try {
-              const storage = getStorage()
-              storage.setItem('clearideasPublicChatSessionId', cached.sessionId)
-            } catch (err) {
-              debugWarn('[ClearIdeasWidget] Failed to persist cached session ID:', err)
-            }
-          }
-          if (cached.data.chatName) {
-            chatName.value = cached.data.chatName
-          }
-          isNewChat.value = true
-          loadingInit.value = false
-
-          // Trigger hello bubble if enabled (after nextTick to ensure FAB is mounted)
-          // The bubble's own localStorage key controls whether it's shown, independent of init cache
-          nextTick(() => {
-            showHelloBubble()
-          })
-
-          return
-        }
-      }
-      // No valid cache or cache is stale - fall through to retry logic below
-    }
-
-    // Allow other non-ok responses to be handled
-    // 304 has response.ok === false, but we want to handle it specially above
-    if (!response.ok && response.status !== 304) {
-      console.warn('[ClearIdeasWidget] Init request failed:', response.status, response.statusText)
-      // Clear cache on 401/403 (session expired)
+    if (!response.ok) {
       if (response.status === 401 || response.status === 403) {
+        // The server refuses this widget: nothing a visitor can do, so the launcher is hidden.
+        console.warn(
+          `[ClearIdeasWidget] Init request failed: ${response.status} ${response.statusText}. ` +
+            'The launcher is hidden. Check the access key, that chat is enabled for the site, and that this origin is allowed.',
+        )
+        initRejected.value = true
         clearCachedInitData()
-        debugLog('[ClearIdeasWidget] Cleared cache due to authentication error')
+      } else {
+        console.warn(
+          '[ClearIdeasWidget] Init request failed:',
+          response.status,
+          response.statusText,
+        )
       }
       return
     }
+    initRejected.value = false
 
-    // Extract and store session ID from response header
-    // Note: Custom headers must be exposed via CORS header: Access-Control-Expose-Headers: x-clearideas-public-chat-session-id
+    // Requires Access-Control-Expose-Headers on cross-origin servers (protocol README §3.3).
     const responseSessionId = response.headers.get('x-clearideas-public-chat-session-id')
     if (responseSessionId) {
       sessionId.value = responseSessionId
-      if (typeof window !== 'undefined') {
-        try {
-          const storage = getStorage()
-          storage.setItem('clearideasPublicChatSessionId', responseSessionId)
-          debugLog(
-            `[ClearIdeasWidget] Session ID stored in ${shouldUsePersistentStorage.value ? 'localStorage' : 'sessionStorage'}:`,
-            responseSessionId,
-          )
-        } catch (err) {
-          debugWarn('[ClearIdeasWidget] Failed to persist session ID from response:', err)
-          // Continue - session ID is still set in memory
-        }
-      }
-    } else {
-      // Debug: Log available headers (only standard ones will be visible if CORS headers not exposed)
-      const availableHeaders: string[] = []
-      response.headers.forEach((_value, key) => {
-        availableHeaders.push(key)
-      })
-      debugWarn(
-        '[ClearIdeasWidget] No x-clearideas-public-chat-session-id header accessible in /init response.',
-        'Available headers:',
-        availableHeaders,
-        'If header exists in raw response, server must expose it via Access-Control-Expose-Headers',
-      )
+      storeSessionId(responseSessionId)
     }
 
-    // Handle 304 Not Modified responses - these may have empty bodies
-    // With cache: 'no-store', 304 should be rare, but handle it as a safety net
-    let data: InitResponse
-    if (response.status === 304) {
-      console.warn(
-        '[ClearIdeasWidget] Received 304 Not Modified response (unexpected with cache: no-store)',
-      )
-      console.log('[ClearIdeasWidget] 304 response - attempting to parse body')
-      // For 304, try to parse the response body (browser should provide cached body)
-      // If parsing fails or body is empty, retry with cache: 'no-store' to force fresh data
-      try {
-        const text = await response.text()
-        console.log('[ClearIdeasWidget] 304 response body length:', text.length)
-        debugLog('[ClearIdeasWidget] 304 response body length:', text.length)
-        if (text) {
-          data = JSON.parse(text)
-          console.log('[ClearIdeasWidget] Successfully parsed 304 response body')
-          debugLog('[ClearIdeasWidget] Successfully parsed 304 response body')
-        } else {
-          // Empty body on 304 - retry with cache: 'no-store' to get fresh data
-          console.warn(
-            '[ClearIdeasWidget] Received 304 response with empty body. Retrying with cache bypass.',
-          )
-          const retryResponse = await fetch(`${apiUrl.value}/public/chat/init`, {
-            method: 'GET',
-            headers,
-            credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-            cache: 'no-store',
-          })
-          debugLog('[ClearIdeasWidget] Retry response:', {
-            status: retryResponse.status,
-            ok: retryResponse.ok,
-          })
-          if (!retryResponse.ok) {
-            console.warn(
-              '[ClearIdeasWidget] Retry request failed:',
-              retryResponse.status,
-              retryResponse.statusText,
-            )
-            return
-          }
-          try {
-            data = await retryResponse.json()
-            debugLog('[ClearIdeasWidget] Successfully parsed retry response')
-          } catch (retryParseError) {
-            console.warn('[ClearIdeasWidget] Failed to parse retry response JSON:', retryParseError)
-            return
-          }
-        }
-      } catch (parseError) {
-        // Failed to parse 304 response - retry with cache: 'no-store' to get fresh data
-        console.warn(
-          '[ClearIdeasWidget] Failed to parse 304 response body. Retrying with cache bypass.',
-          parseError,
-        )
-        try {
-          const retryResponse = await fetch(`${apiUrl.value}/public/chat/init`, {
-            method: 'GET',
-            headers,
-            credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-            cache: 'no-store',
-          })
-          debugLog('[ClearIdeasWidget] Retry response (from catch):', {
-            status: retryResponse.status,
-            ok: retryResponse.ok,
-          })
-          if (!retryResponse.ok) {
-            console.warn(
-              '[ClearIdeasWidget] Retry request failed:',
-              retryResponse.status,
-              retryResponse.statusText,
-            )
-            return
-          }
-          try {
-            data = await retryResponse.json()
-            debugLog('[ClearIdeasWidget] Successfully parsed retry response (from catch)')
-          } catch (retryParseError) {
-            console.warn('[ClearIdeasWidget] Failed to parse retry response JSON:', retryParseError)
-            return
-          }
-        } catch (retryError) {
-          console.warn('[ClearIdeasWidget] Retry request also failed:', retryError)
-          return
-        }
-      }
-    } else {
-      // For non-304 responses, parse JSON with error handling
-      try {
-        data = await response.json()
-        // Always log successful parse - critical for debugging
-        console.log('[ClearIdeasWidget] Successfully parsed init response', {
-          hasChatName: !!data.chatName,
-          hasActions: !!(data.links && data.links.length > 0),
-        })
-        debugLog('[ClearIdeasWidget] Successfully parsed init response', {
-          hasChatName: !!data.chatName,
-          hasActions: !!(data.links && data.links.length > 0),
-        })
-      } catch (parseError) {
-        console.warn('[ClearIdeasWidget] Failed to parse init response JSON:', parseError)
-        return
-      }
-    }
-
-    // Log the actual data before setting it
-    console.log('[ClearIdeasWidget] About to set initData.value', {
-      dataKeys: Object.keys(data),
-      hasChatName: !!data.chatName,
-      hasLinks: !!(data.links && data.links.length > 0),
-      helloBubbleEnabled: data.helloBubbleEnabled,
-      helloBubbleText: data.helloBubbleText,
-      helloBubbleDelay: data.helloBubbleDelay,
-      disclaimerText: data.disclaimerText,
-      disclaimerDialogEnabled: data.disclaimerDialogEnabled,
-      disclaimerDialogText: data.disclaimerDialogText,
-      dataPreview: JSON.stringify(data).substring(0, 200),
-    })
-
-    initData.value = data
+    const body = (await response.json()) as InitResponse | null
+    if (!isCurrent()) return
+    if (!body || typeof body !== 'object') throw new Error('Invalid init response')
+    const data = sanitizeInitData(body)
+    applyInitData(data)
     setCachedInitData(data)
-
-    // Trigger hello bubble if enabled (after nextTick to ensure FAB is mounted)
-    nextTick(() => {
-      showHelloBubble()
-    })
-
-    // Always log when initData is set - critical for debugging
-    console.log('[ClearIdeasWidget] initData.value set successfully', {
-      hasInitData: !!initData.value,
-      chatName: initData.value?.chatName,
-      initDataValueType: typeof initData.value,
-      initDataValueIsNull: initData.value === null,
-      initDataValueIsUndefined: initData.value === undefined,
-    })
-    debugLog('[ClearIdeasWidget] initData.value set successfully', {
-      hasInitData: !!initData.value,
-      chatName: initData.value?.chatName,
-    })
-
-    if (data.chatName) {
-      chatName.value = data.chatName
-    }
-    isNewChat.value = true
-
-    console.log('[ClearIdeasWidget] loadInitData() completed successfully')
-    debugLog('[ClearIdeasWidget] loadInitData() completed successfully')
   } catch (err) {
+    if (!isCurrent()) return // superseded by a newer load, or the widget was destroyed
     console.error('[ClearIdeasWidget] Failed to load init data:', err)
-    console.error('[ClearIdeasWidget] Error details:', {
-      message: err instanceof Error ? err.message : String(err),
-      stack: err instanceof Error ? err.stack : undefined,
-      initDataAtError: initData.value ? 'exists' : 'null',
-    })
-    debugLog('[ClearIdeasWidget] Error details:', {
-      message: err instanceof Error ? err.message : String(err),
-      stack: err instanceof Error ? err.stack : undefined,
-      initDataAtError: initData.value ? 'exists' : 'null',
-    })
   } finally {
-    loadingInit.value = false
-    console.log('[ClearIdeasWidget] loadInitData() finished', {
-      loadingInit: loadingInit.value,
-      hasInitData: !!initData.value,
-    })
-    debugLog('[ClearIdeasWidget] loadInitData() finished', {
-      loadingInit: loadingInit.value,
-      hasInitData: !!initData.value,
-    })
+    // Only the newest load ends the loading state.
+    if (initRequest === request) {
+      initRequest = null
+      loadingInit.value = false
+    }
   }
+}
+
+function applyInitData(data: InitResponse) {
+  initData.value = data
+  if (data.chatName) chatName.value = data.chatName
+  isNewChat.value = true
+  // The bubble's own storage flag decides whether it is shown.
+  nextTick(() => showHelloBubble())
 }
 
 async function activateChatSession() {
@@ -1568,6 +1123,7 @@ async function activateChatSession() {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${props.accessKey}`,
     'Accept-Language': widgetLocale.value,
+    ...userIdHeaders(),
     'x-clearideas-public-chat-consent-status': consentStatus.value,
   }
 
@@ -1575,35 +1131,152 @@ async function activateChatSession() {
     headers['x-clearideas-public-chat-session'] = sessionId.value
   }
 
-  const response = await fetch(`${apiUrl.value}/public/chat/session`, {
-    method: 'POST',
-    headers,
-    credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-    cache: 'no-store',
-  })
+  sessionRequest?.abort()
+  const request = new AbortController()
+  sessionRequest = request
+  const isCurrent = () => sessionRequest === request && !unmounted
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+  let response: Response
+  let data: SessionActivationResponse
+  try {
+    response = await fetch(`${apiUrl.value}/public/chat/session`, {
+      method: 'POST',
+      headers,
+      credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
+      cache: 'no-store',
+      signal: request.signal,
+    })
+    if (!isCurrent()) return
+    if (!response.ok) throw await errorFromResponse(response)
+    data = await response.json()
+    if (!isCurrent()) return
+  } catch (error) {
+    if (!isCurrent()) return // superseded by a newer activation, or the widget was destroyed
+    throw error
+  } finally {
+    if (sessionRequest === request) sessionRequest = null
   }
 
   const responseSessionId = response.headers.get('x-clearideas-public-chat-session-id')
   const effectiveSessionId = responseSessionId || currentSessionId || null
   if (responseSessionId) {
     sessionId.value = responseSessionId
-    try {
-      const storage = getStorage()
-      storage.setItem('clearideasPublicChatSessionId', responseSessionId)
-    } catch (err) {
-      debugWarn('[ClearIdeasWidget] Failed to persist session ID from activation:', err)
-    }
+    storeSessionId(responseSessionId)
   }
 
-  const data: SessionActivationResponse = await response.json()
   activatedSessionId.value = effectiveSessionId
   applyExistingChat(data.existingChat)
 }
 
 // Send message to public chat API using streaming endpoint
+/**
+ * The reply being requested or streamed. `reason` says why it ended early: the visitor stopped it
+ * (what arrived is kept), nothing arrived for replyTimeoutMs (reported as an error), or null when
+ * the widget cancelled it (new chat, language change, destroy; partial text is dropped).
+ */
+interface ReplyRequest {
+  controller: AbortController
+  reason: 'stopped' | 'timeout' | null
+  timer: number | null
+}
+let activeReply: ReplyRequest | null = null
+
+const DEFAULT_REPLY_TIMEOUT_MS = 120_000
+
+function beginReply(): ReplyRequest {
+  abortController.value?.abort() // a previous request, if any, is cancelled
+  const request: ReplyRequest = { controller: new AbortController(), reason: null, timer: null }
+  abortController.value = request.controller
+  activeReply = request
+  keepReplyAlive(request)
+  return request
+}
+
+/** (Re)starts the silence timer: called when the request starts and whenever data arrives. */
+function keepReplyAlive(request: ReplyRequest) {
+  if (request.timer !== null) clearTimeout(request.timer)
+  const timeout =
+    props.replyTimeoutMs && props.replyTimeoutMs > 0
+      ? props.replyTimeoutMs
+      : DEFAULT_REPLY_TIMEOUT_MS
+  request.timer = window.setTimeout(() => {
+    request.reason = 'timeout'
+    request.controller.abort()
+  }, timeout)
+}
+
+function endReply(request: ReplyRequest) {
+  if (request.timer !== null) clearTimeout(request.timer)
+  request.timer = null
+  if (activeReply === request) activeReply = null
+  if (abortController.value === request.controller) abortController.value = null
+}
+
+/** Stops the reply in progress at the visitor's request (the stop button). */
+function stopReply() {
+  if (!activeReply) return
+  activeReply.reason = 'stopped'
+  activeReply.controller.abort()
+  stopAllAudio() // a spoken reply stops too
+}
+
+/** Reads a reply stream, restarting the silence timer on every chunk (keep-alives included). */
+async function readReplyStream(
+  request: ReplyRequest,
+  response: Response,
+  onData: (data: string) => void,
+) {
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  const parser = createSseParser(onData)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (request.controller.signal.aborted) {
+        void reader.cancel().catch(() => undefined)
+        throw new DOMException('Reply aborted', 'AbortError')
+      }
+      if (done) {
+        parser.push(decoder.decode())
+        parser.end() // a last event without a closing blank line still counts
+        break
+      }
+      keepReplyAlive(request)
+      parser.push(decoder.decode(value, { stream: true }))
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  // Ended cleanly without a done event: keep the text received so far (protocol README §6.2).
+  if (streamingAssistantIndex.value >= 0 && streamingContent.value) {
+    messages.value[streamingAssistantIndex.value].content = streamingContent.value
+  }
+  streamingAssistantIndex.value = -1
+  streamingContent.value = ''
+}
+
+/**
+ * Handles a reply that was aborted. Returns true when nothing more is to be done; false for a
+ * timeout, which the caller reports like a failed request.
+ */
+function endAbortedReply(request: ReplyRequest): boolean {
+  if (request.reason === 'timeout') return false
+  const index = streamingAssistantIndex.value
+  if (request.reason === 'stopped') {
+    // Stopped by the visitor: keep what arrived.
+    if (index >= 0 && streamingContent.value) messages.value[index].content = streamingContent.value
+  } else if (index >= 0) {
+    // Cancelled by the widget: drop the partial reply.
+    messages.value.splice(index, 1)
+  }
+  streamingAssistantIndex.value = -1
+  streamingContent.value = ''
+  return true
+}
+
+const isAbortError = (err: unknown) =>
+  err !== null && typeof err === 'object' && 'name' in err && err.name === 'AbortError'
+
 async function sendPublicChatMessage(content: string) {
   if (!content.trim() || loading.value) return
 
@@ -1619,11 +1292,7 @@ async function sendPublicChatMessage(content: string) {
     return
   }
 
-  if (abortController.value) {
-    abortController.value.abort()
-  }
-
-  abortController.value = new AbortController()
+  const request = beginReply()
 
   loading.value = true
   error.value = null
@@ -1631,7 +1300,7 @@ async function sendPublicChatMessage(content: string) {
   streamingAssistantIndex.value = -1
 
   const requestUrl = chatId.value
-    ? `${apiUrl.value}/public/chat/${chatId.value}/stream`
+    ? `${apiUrl.value}/public/chat/${encodeURIComponent(chatId.value)}/stream`
     : `${apiUrl.value}/public/chat/stream`
 
   try {
@@ -1650,6 +1319,7 @@ async function sendPublicChatMessage(content: string) {
     headers.set('Content-Type', 'application/json')
     headers.set('Accept', 'text/event-stream')
     headers.set('Accept-Language', widgetLocale.value)
+    for (const [name, value] of Object.entries(userIdHeaders())) headers.set(name, value)
 
     // Include session ID if available
     if (sessionId.value) {
@@ -1665,83 +1335,34 @@ async function sendPublicChatMessage(content: string) {
         },
       }),
       credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-      signal: abortController.value.signal,
+      signal: request.controller.signal,
     })
+    keepReplyAlive(request)
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ message: t('chat.unknownError') }))
-      throw new Error(errorData.message || `HTTP ${response.status}: ${response.statusText}`)
-    }
+    if (!response.ok) throw await errorFromResponse(response)
+    if (!response.body) throw new Error('Response has no body')
 
-    if (!response.body) {
-      throw new Error(t('chat.responseBodyNull'))
-    }
-
-    // Don't create assistant message upfront - wait for content to start streaming
-    // The assistant message will be created when the first content event arrives
-
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-
-        if (done) {
-          if (streamingAssistantIndex.value >= 0 && streamingContent.value) {
-            messages.value[streamingAssistantIndex.value].content = streamingContent.value
-          }
-          streamingAssistantIndex.value = -1
-          streamingContent.value = ''
-          break
-        }
-
-        if (abortController.value?.signal.aborted) {
-          reader.cancel()
-          break
-        }
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data: StreamEvent = JSON.parse(line.slice(6))
-              handleStreamEvent(data)
-            } catch (parseError) {
-              console.warn('[ClearIdeasWidget] Failed to parse SSE event:', parseError)
-            }
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock()
-    }
+    // The assistant message is created when the first content event arrives.
+    await readReplyStream(request, response, data => processStreamData(data))
   } catch (err) {
-    console.error('[ClearIdeasWidget] Request failed:', err)
+    if (isAbortError(err) && endAbortedReply(request)) return
 
-    if (err instanceof Error && err.name === 'AbortError') {
-      if (streamingAssistantIndex.value >= 0) {
-        messages.value.splice(streamingAssistantIndex.value, 1)
-      }
-      streamingAssistantIndex.value = -1
-      streamingContent.value = ''
-      return
-    }
-
-    if (err instanceof TypeError && err.message === 'Failed to fetch') {
-      error.value = t('chat.corsError', { url: requestUrl })
-    } else if (err instanceof Error) {
-      error.value = err.message
+    if (request.reason === 'timeout') {
+      console.warn(
+        '[ClearIdeasWidget] No reply data for the reply timeout; the request was abandoned.',
+      )
+      error.value = t('chat.replyTimeout')
     } else {
-      error.value = t('chat.sendFailed')
+      console.error('[ClearIdeasWidget] Request failed:', err)
+      error.value = requestErrorMessage(err, 'chat.sendFailed')
     }
 
-    if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'user') {
+    const last = messages.value[messages.value.length - 1]
+    if (request.reason !== 'timeout' && last?.role === 'user') {
+      // Not delivered: withdraw it and give the text back so the visitor can retry. (After a
+      // timeout the server may have it, so it stays.)
       messages.value.pop()
+      if (!chatInputContent.value.trim()) chatInputContent.value = content
     }
 
     if (streamingAssistantIndex.value >= 0) {
@@ -1750,9 +1371,68 @@ async function sendPublicChatMessage(content: string) {
     }
     streamingContent.value = ''
   } finally {
-    loading.value = false
-    abortController.value = null
+    endReply(request)
+    // A newer request may already be loading (this one was cancelled for it).
+    if (!activeReply) loading.value = false
   }
+}
+
+/**
+ * Handles the data of one stream event (protocol README §6). Data that is not JSON is retried line
+ * by line, for servers that send consecutive `data:` lines without blank lines between events (which
+ * widget 0.1.x accepted). A malformed event, or a failure while handling one, does not stop the stream.
+ */
+function processStreamData(data: string, voiceMode = false) {
+  let events: StreamEvent[]
+  try {
+    events = [JSON.parse(data)]
+  } catch (parseError) {
+    const lines = data.split('\n').filter(line => line.trim())
+    try {
+      if (lines.length < 2) throw parseError
+      events = lines.map(line => JSON.parse(line))
+    } catch {
+      console.warn('[ClearIdeasWidget] Ignored malformed stream event:', parseError)
+      return
+    }
+  }
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue
+    try {
+      handleStreamEvent(event, voiceMode)
+    } catch (handlerError) {
+      console.error(
+        `[ClearIdeasWidget] Failed to handle "${String(event.type)}" event:`,
+        handlerError,
+      )
+    }
+  }
+}
+
+/**
+ * Message for a failed request. fetch and stream reads reject with a TypeError on network failures
+ * (unreachable server, dropped connection, or a CORS rejection), whose text differs by browser.
+ */
+function requestErrorMessage(err: unknown, fallbackKey: string): string {
+  if (err instanceof TypeError) {
+    console.warn(
+      '[ClearIdeasWidget] Network error. If the server is reachable, check that its CORS settings allow this origin (see docs/protocol §3.3).',
+    )
+    return t('chat.connectionError')
+  }
+  if (err instanceof ServerMessageError) return err.message
+  return t(fallbackKey)
+}
+
+/**
+ * The error for a failed response: the server's error body message when it has one (servers may
+ * localize it, protocol README §8), otherwise a technical error that shows a generic message.
+ */
+async function errorFromResponse(response: Response): Promise<Error> {
+  const body = await response.json().catch(() => null)
+  const message = body && typeof body === 'object' ? (body as { message?: unknown }).message : null
+  if (typeof message === 'string' && message.trim()) return new ServerMessageError(message)
+  return new Error(`HTTP ${response.status} ${response.statusText}`)
 }
 
 // Handle streaming events
@@ -1834,35 +1514,14 @@ function handleStreamEvent(event: StreamEvent, voiceMode: boolean = false) {
         const messageIndex = streamingAssistantIndex.value
         messages.value[messageIndex].audio = event.audio
 
-        // If MediaSource progressive playback is already working, append any remaining chunks and end stream
         const state = messageAudioState.value.get(messageIndex)
-        if (
-          state?.isUsingProgressivePlayback &&
-          state.mediaSource &&
-          state.sourceBuffer &&
-          state.mediaSource.readyState === 'open'
-        ) {
-          console.log('[ClearIdeasWidget] Complete audio received, ending MediaSource stream', {
-            messageIndex,
-            totalChunks: state.audioChunks?.length || 0,
-          })
-          // Append any remaining chunks and end stream
-          appendRemainingChunksAndEndStream(messageIndex)
-        } else if (state?.audio && !state.audio.paused && state.isUsingProgressivePlayback) {
-          // Already playing via MediaSource, just store for replay
-          console.log(
-            '[ClearIdeasWidget] Progressive playback already active, storing complete audio for replay',
-            {
-              messageIndex,
-            },
-          )
+        if (state?.isUsingProgressivePlayback) {
+          // Progressive playback is running or still opening (this event can arrive before the
+          // MediaSource opens): its stream ends once every chunk is appended.
+          state.completeAudioReceived = true
+          endProgressiveStreamIfComplete(state)
         } else {
-          // No active playback, start with complete audio
-          console.log('[ClearIdeasWidget] Playing complete audio', {
-            messageIndex,
-            hasMediaSource: !!state?.mediaSource,
-            isUsingProgressivePlayback: state?.isUsingProgressivePlayback,
-          })
+          // No progressive playback: play the complete audio.
           playMessageAudio(messageIndex, event.audio)
         }
       }
@@ -1916,15 +1575,9 @@ function handleStreamEvent(event: StreamEvent, voiceMode: boolean = false) {
             // Play complete audio if not already playing
             const state = messageAudioState.value.get(messageIndex)
             if (!state?.isPlaying) {
-              console.log('[ClearIdeasWidget] Playing complete audio from done event', {
-                messageIndex,
-              })
               playMessageAudio(messageIndex, event.audio)
             } else {
               // If already playing, update stored audio for replay but don't interrupt
-              console.log('[ClearIdeasWidget] Audio already playing, storing for replay', {
-                messageIndex,
-              })
             }
           }
         }
@@ -1963,16 +1616,32 @@ function handleStreamEvent(event: StreamEvent, voiceMode: boolean = false) {
   }
 }
 
-async function openWidget() {
+/** Moves keyboard focus into the panel: the text box in chat view, otherwise the first action. */
+function focusPanel() {
+  nextTick(() => {
+    const panel = panelRef.value
+    if (!panel) return
+    const target =
+      currentView.value === 'chat'
+        ? panel.querySelector<HTMLElement>('textarea')
+        : panel.querySelector<HTMLElement>('.ci-widget-action')
+    ;(target ?? panel.querySelector<HTMLElement>('button, textarea, a[href]'))?.focus()
+  })
+}
+
+/** True if keyboard focus is inside the open panel (in the shadow root or the page). */
+function focusIsInPanel(): boolean {
+  const panel = panelRef.value
+  if (!panel) return false
+  const active = (panel.getRootNode() as Document | ShadowRoot).activeElement
+  return !!active && panel.contains(active)
+}
+
+async function openWidget(options: { focus?: boolean } = {}) {
   const requestToken = ++openRequestToken.value
 
   // Initialize audio context on first user interaction
   initAudioContext()
-
-  console.log(
-    '[ClearIdeasWidget] openWidget called, current messages count:',
-    messages.value.length,
-  )
 
   // Don't open widget until initialization succeeds
   // If initData already exists, we can open immediately
@@ -1992,6 +1661,8 @@ async function openWidget() {
     // Only open if initialization succeeded (initData was loaded)
     if (!initData.value) {
       console.warn('[ClearIdeasWidget] Cannot open widget: initialization failed')
+      // A refused widget has no launcher; otherwise tell the visitor (the next click retries).
+      if (!initRejected.value && !unmounted) showUnavailableNotice()
       return
     }
   }
@@ -1999,13 +1670,13 @@ async function openWidget() {
   try {
     await activateChatSession()
   } catch (activationError) {
+    if (unmounted) return // widget destroyed while opening
     console.warn(
       '[ClearIdeasWidget] Session activation failed during open; continuing with new chat state',
       activationError,
     )
     applyExistingChat(undefined)
-    error.value =
-      activationError instanceof Error ? activationError.message : t('chat.unknownError')
+    error.value = requestErrorMessage(activationError, 'chat.unknownError')
   }
 
   if (requestToken !== openRequestToken.value || isOpen.value) {
@@ -2025,22 +1696,28 @@ async function openWidget() {
 
   // Disclaimer dialog will be shown via watcher when view switches to chat
 
-  nextTick(() => {
-    shouldFocusInput.value = false
-    nextTick(() => (shouldFocusInput.value = true))
-  })
+  // Focus follows a visitor's action, but opening on page load does not take the page's focus.
+  if (options.focus !== false) focusPanel()
 }
 
 function closeWidget() {
+  const returnFocus = focusIsInPanel()
   openRequestToken.value += 1
   isOpen.value = false
-  if (abortController.value) {
-    abortController.value.abort()
-    abortController.value = null
-  }
-  if (realtimeVoiceModeOpen.value || voiceInputActive.value) cancelVoiceInput()
+  // A reply in progress continues and is there when the panel reopens.
+  // Unconditional: a microphone permission prompt may still be pending (nothing active yet).
+  cancelVoiceInput()
   // Stop all audio playback
   stopAllAudio()
+  if (returnFocus) nextTick(() => fabRef.value?.$el?.focus())
+}
+
+/** Escape closes the panel (and returns focus to the launcher). */
+function handleKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && isOpen.value) {
+    event.stopPropagation()
+    closeWidget()
+  }
 }
 
 function toggleWidget() {
@@ -2063,10 +1740,28 @@ async function openChatDirectly() {
   }
   // Set view to chat (skip home view)
   currentView.value = 'chat'
+  focusPanel()
 }
 
 // FAB visibility state (defaults to prop value)
 const fabVisible = ref(!props.fabHide)
+// The server refused the widget (401 or 403 on init): the launcher stays hidden.
+const initRejected = ref(false)
+const launcherShown = computed(() => fabVisible.value && !initRejected.value)
+
+// "Chat is unavailable" notice by the launcher, after opening failed (server unreachable or erroring).
+const UNAVAILABLE_NOTICE_MS = 6000
+const unavailableNoticeVisible = ref(false)
+let unavailableNoticeTimer: number | null = null
+
+function showUnavailableNotice() {
+  unavailableNoticeVisible.value = true
+  if (unavailableNoticeTimer !== null) clearTimeout(unavailableNoticeTimer)
+  unavailableNoticeTimer = later(() => {
+    unavailableNoticeVisible.value = false
+    unavailableNoticeTimer = null
+  }, UNAVAILABLE_NOTICE_MS)
+}
 
 function hideFab() {
   fabVisible.value = false
@@ -2135,8 +1830,9 @@ function setUserEmail(email: string | undefined) {
   userEmailOverride.value = email
 }
 
-function setUserId(id: string | undefined) {
-  userIdOverride.value = id
+/** Sets the signed-in user; undefined, null or '' means signed out (also over the userId option). */
+function setUserId(id: string | null | undefined) {
+  userIdOverride.value = typeof id === 'string' ? id : ''
 }
 
 function setLocale(locale: string | undefined) {
@@ -2171,6 +1867,8 @@ defineExpose({
   setUserEmail,
   setUserId,
   setLocale,
+  setMessages,
+  stopReply,
 })
 
 async function handleSendMessage(content: string) {
@@ -2192,50 +1890,32 @@ function trySendChatInput() {
 
 onMounted(async () => {
   startWidgetLocaleTracking()
+  startPageThemeTracking()
   syncWidgetLocale()
-  // Always log that widget is mounting
 
   // Initialize audio context on any page interaction
   // This allows the hello bubble sound to work even before user clicks the widget
   initAudioContextOnInteraction()
-  console.log(
-    '[ClearIdeasWidget] Widget mounted - set window.__ClearIdeasWidgetDebug = true for detailed logs',
-  )
 
-  // Load session ID respecting consent state
-  const storedSessionId = getStoredSessionId()
-  if (storedSessionId) {
-    sessionId.value = storedSessionId
-    // Determine which storage was actually used (same logic as getStoredSessionId)
-    let storageType: string
-    if (shouldUsePersistentStorage.value) {
-      storageType = localStorage.getItem('clearideasPublicChatSessionId')
-        ? 'localStorage'
-        : 'sessionStorage'
-    } else {
-      storageType = 'sessionStorage'
-    }
-    debugLog(`[ClearIdeasWidget] Loaded existing session ID from ${storageType}:`, storedSessionId)
-  } else {
-    debugLog('[ClearIdeasWidget] No existing session ID found in storage')
+  // Adopt values stored by widget 0.1.x under un-namespaced keys (once).
+  if (apiUrl.value && props.accessKey) {
+    migrateLegacyKeys(storageNamespace(apiUrl.value, props.accessKey))
   }
+
+  const storedSessionId = getStoredSessionId()
+  if (storedSessionId) sessionId.value = storedSessionId
 
   await loadInitData()
   hasCompletedInitialInitLoad.value = true
   if (props.openOnLoad) {
-    await openWidget()
+    await openWidget({ focus: false })
   }
-  nextTick(() => {
-    addClickEventListener()
-    initializeTippy()
-    initializeButtonTooltips()
-  })
 })
 
 watch(
   resolvedLocale,
   value => {
-    setWidgetLocale(value)
+    i18n.setLocale(value)
   },
   { immediate: true },
 )
@@ -2243,181 +1923,64 @@ watch(
 watch(
   widgetLocale,
   async (value, previousValue) => {
-    nextTick(() => {
-      resetButtonTooltips()
-      initializeButtonTooltips()
-    })
-
     if (hasCompletedInitialInitLoad.value && previousValue && value !== previousValue) {
       clearCachedInitData()
       clearStoredSessionId()
-      resetChatStateForLocaleChange()
-
-      if (apiUrl.value && props.accessKey) {
-        await loadInitData()
-      }
+      resetChatState()
+      await reloadAfterReset()
     }
   },
   { immediate: true },
 )
 
-// Helper functions for setting refs from child components
-function setVoiceBtnRef(el: HTMLElement | null) {
-  voiceBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
-function setSendBtnRef(el: HTMLElement | null) {
-  sendBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
-function setCancelBtnRef(el: HTMLElement | null) {
-  cancelBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
-function setAcceptBtnRef(el: HTMLElement | null) {
-  acceptBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
-function setBackBtnRef(el: HTMLElement | null) {
-  backBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
-function setCloseBtnRef(el: HTMLElement | null) {
-  closeBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
-function setFabBtnRef(el: HTMLElement | null) {
-  fabBtnRef.value = el
-  nextTick(() => initializeButtonTooltips())
-}
+// A different signed-in user (or signing out) gets their own conversation: the stored session is
+// per user (storageKeyFor), and the server scopes chats to the user ID.
+watch(currentUserId, async (value, previousValue) => {
+  if (!hasCompletedInitialInitLoad.value || value === previousValue) return
+  resetChatState()
+  await reloadAfterReset()
+})
 
-function resetButtonTooltips() {
-  tippyInstances.value.forEach(instance => {
-    instance.destroy()
-  })
-  tippyInstances.value.clear()
+/** After a reset: new configuration, and, with the panel open, that user's conversation. */
+async function reloadAfterReset() {
+  if (!apiUrl.value || !props.accessKey) return
+  await loadInitData()
+  if (isOpen.value && initData.value) {
+    try {
+      await activateChatSession()
+    } catch (activationError) {
+      console.warn('[ClearIdeasWidget] Session activation failed after a reset', activationError)
+    }
+  }
 }
 
 function syncWidgetLocale() {
-  setWidgetLocale(resolvedLocale.value)
+  i18n.setLocale(resolvedLocale.value)
 }
 
-// Initialize tooltips for buttons
-function initializeButtonTooltips() {
-  // Voice button tooltip - only if visible (not recording)
-  if (voiceBtnRef.value && !isRecording.value && !tippyInstances.value.has(voiceBtnRef.value)) {
-    const instance = tippy(voiceBtnRef.value, {
-      content: t('input.voiceModeTooltip'),
-      placement: 'top',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(voiceBtnRef.value, instance)
-  }
+// Custom strings (the messages option and setMessages()).
+const messagesOverride = ref<WidgetMessagesOption | undefined>(undefined)
+watch(
+  () => messagesOverride.value ?? props.messages,
+  value => i18n.setMessages(value),
+  { immediate: true },
+)
 
-  // Send button tooltip - only if visible (not recording)
-  if (sendBtnRef.value && !isRecording.value && !tippyInstances.value.has(sendBtnRef.value)) {
-    const instance = tippy(sendBtnRef.value, {
-      content: t('input.sendMessage'),
-      placement: 'top',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(sendBtnRef.value, instance)
-  }
-
-  // Cancel button tooltip - only if visible (recording)
-  if (cancelBtnRef.value && isRecording.value && !tippyInstances.value.has(cancelBtnRef.value)) {
-    const instance = tippy(cancelBtnRef.value, {
-      content: t('input.cancelRecording'),
-      placement: 'top',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(cancelBtnRef.value, instance)
-  }
-
-  // Accept button tooltip - only if visible (recording)
-  if (acceptBtnRef.value && isRecording.value && !tippyInstances.value.has(acceptBtnRef.value)) {
-    const instance = tippy(acceptBtnRef.value, {
-      content: t('input.sendRecording'),
-      placement: 'top',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(acceptBtnRef.value, instance)
-  }
-
-  // Back button tooltip
-  if (backBtnRef.value && !tippyInstances.value.has(backBtnRef.value)) {
-    const instance = tippy(backBtnRef.value, {
-      content: t('header.backToHome'),
-      placement: 'bottom',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(backBtnRef.value, instance)
-  }
-
-  // Close button tooltip
-  if (closeBtnRef.value && !tippyInstances.value.has(closeBtnRef.value)) {
-    const instance = tippy(closeBtnRef.value, {
-      content: t('fab.closeChat'),
-      placement: 'bottom',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(closeBtnRef.value, instance)
-  }
-
-  // New chat button tooltip
-  if (newChatBtnRef.value && !tippyInstances.value.has(newChatBtnRef.value)) {
-    const instance = tippy(newChatBtnRef.value, {
-      content: t('chat.newChat'),
-      placement: 'top',
-      theme: 'light-border',
-      arrow: true,
-    })
-    tippyInstances.value.set(newChatBtnRef.value, instance)
-  }
-
-  // FAB button tooltip - update content dynamically
-  if (fabBtnRef.value) {
-    if (tippyInstances.value.has(fabBtnRef.value)) {
-      const instance = tippyInstances.value.get(fabBtnRef.value)
-      instance?.setContent(isOpen.value ? t('fab.closeChat') : t('fab.openChat'))
-    } else {
-      const instance = tippy(fabBtnRef.value, {
-        content: isOpen.value ? t('fab.closeChat') : t('fab.openChat'),
-        placement: 'left',
-        theme: 'light-border',
-        arrow: true,
-      })
-      tippyInstances.value.set(fabBtnRef.value, instance)
-    }
-  }
-
-  // Audio play/pause buttons
-  audioBtnRefs.value.forEach((element: HTMLElement, index: number) => {
-    if (element && !tippyInstances.value.has(element)) {
-      const instance = tippy(element, {
-        content: isMessageAudioPlaying(index) ? t('audio.pause') : t('audio.play'),
-        placement: 'top',
-        theme: 'light-border',
-        arrow: true,
-      })
-      tippyInstances.value.set(element, instance)
-    } else if (element && tippyInstances.value.has(element)) {
-      // Update existing tooltip content
-      const instance = tippyInstances.value.get(element)
-      instance?.setContent(isMessageAudioPlaying(index) ? t('audio.pause') : t('audio.play'))
-    }
-  })
+function setMessages(messages: WidgetMessagesOption | undefined) {
+  messagesOverride.value = messages ?? undefined
 }
 
 onUnmounted(() => {
+  unmounted = true
+  initRequest?.abort()
+  sessionRequest?.abort()
+  removeInteractionListeners?.()
+  pendingTimers.forEach(id => clearTimeout(id))
+  pendingTimers.clear()
+  void audioContext?.close().catch(() => undefined)
+  audioContext = null
   stopWidgetLocaleTracking()
-  resetButtonTooltips()
+  stopPageThemeTracking()
   if (abortController.value) {
     abortController.value.abort()
     abortController.value = null
@@ -2428,9 +1991,7 @@ onUnmounted(() => {
     helloBubbleTimeoutId.value = null
   }
   // Cleanup voice recording
-  if (isRecording.value) {
-    cancelRecording()
-  }
+  cancelRecording() // also when a microphone permission prompt is still pending
   disconnectRealtimeVoice()
   // Stop all message audio
   stopAllAudio()
@@ -2542,10 +2103,10 @@ const helloBubbleStyle = computed(() => {
 // Compute arrow direction and position based on widget position
 const helloBubbleArrowStyle = computed(() => {
   const position = currentWidgetPosition.value
-  // The bubble uses a gradient: linear-gradient(135deg, widgetColor 0%, darker 100%)
-  // Use the exact same color calculation as the gradient for perfect matching
-  const baseColor = widgetColor.value
-  const darkerColor = adjustColorLightness(baseColor, -15) // Same as gradient end
+  // The bubble background is a gradient from the accent (top) to its strong shade (bottom); the
+  // arrow takes the color of the edge it sits on.
+  const baseColor = 'var(--ci-widget-accent)'
+  const darkerColor = 'var(--ci-widget-accent-strong)'
   let arrowColor: string
 
   switch (position) {
@@ -2683,7 +2244,7 @@ const panelStyle = computed(() => {
 const widgetContainerStyle = computed<CSSProperties>(() => {
   const fabSize =
     fabSizeOverride.value !== undefined ? fabSizeOverride.value : (props.fabSize ?? 56)
-  const isFabSurfaceVisible = fabVisible.value
+  const isFabSurfaceVisible = launcherShown.value || unavailableNoticeVisible.value
   const isHelloBubbleSurfaceVisible = isHelloBubbleVisible.value && !!helloBubbleText.value
   const hasVisibleWidgetSurface = isOpen.value || isFabSurfaceVisible || isHelloBubbleSurfaceVisible
 
@@ -2699,16 +2260,18 @@ const displayName = computed(() => {
   const userEmail =
     userEmailOverride.value !== undefined ? userEmailOverride.value : props.userEmail
   const name = userName || userEmail?.split('@')[0]
-  if (!name) return 'there'
-  const first = String(name).split(' ')[0]
-  return first || 'there'
+  // Empty when the visitor is anonymous (the header then greets without a name).
+  return name ? (String(name).trim().split(/\s+/)[0] ?? '') : ''
 })
 
 function handleAction(action: WidgetAction) {
   if (action.type === 'chat') {
     startChat()
-  } else if (action.type === 'link' && action.url) {
-    window.open(action.url, '_blank')
+  } else if (action.type === 'link') {
+    // Only http(s) URLs are opened, in a new tab without access to this page.
+    if (!openExternal(action.url)) {
+      console.warn('[ClearIdeasWidget] Ignored link with an unsupported URL')
+    }
   }
 }
 
@@ -2718,10 +2281,7 @@ async function startChat() {
     await loadInitData()
   }
   currentView.value = 'chat'
-  nextTick(() => {
-    shouldFocusInput.value = false
-    nextTick(() => (shouldFocusInput.value = true))
-  })
+  focusPanel()
 }
 
 function startNewChat() {
@@ -2749,11 +2309,14 @@ function startNewChat() {
 }
 
 function goToHome() {
-  if (realtimeVoiceModeOpen.value || voiceInputActive.value) cancelVoiceInput()
+  cancelVoiceInput() // also cancels a pending microphone permission prompt
   currentView.value = 'home'
 }
 
 // Voice recording wrapper to check voiceEnabled before starting
+// The last realtime failure was the microphone (denied or missing): recorded voice would fail too.
+const microphoneProblem = ref(false)
+
 async function startRecording() {
   if (!voiceEnabled.value) {
     error.value = t('chat.voiceDisabled')
@@ -2761,6 +2324,7 @@ async function startRecording() {
   }
 
   error.value = null
+  microphoneProblem.value = false
   if (supportsRealtimeVoice.value) {
     realtimeTranscriptMessages.clear()
     realtimeUserHasSpoken.value = false
@@ -2769,13 +2333,25 @@ async function startRecording() {
       await connectRealtimeVoice()
       return
     } catch (realtimeError) {
+      // 403: this site has no realtime voice (protocol README §2), so record instead of failing.
+      if (errorStatus(realtimeError) === 403 && supportsVoiceRecording.value) {
+        debugLog('[ClearIdeasWidget] Realtime voice not enabled; using recorded voice')
+        realtimeVoiceModeOpen.value = false
+        disconnectRealtimeVoice()
+        await startVoiceRecording()
+        return
+      }
       // Keep the live-call failure visible. The user can explicitly choose the
       // legacy recorded flow from the dedicated voice screen.
       debugWarn('[ClearIdeasWidget] Realtime voice unavailable', {
         error: realtimeError instanceof Error ? realtimeError.message : String(realtimeError),
       })
+      const kind = microphoneErrorKind(realtimeError, 'unavailable')
+      microphoneProblem.value = kind === 'microphone-denied' || kind === 'microphone-missing'
       error.value =
-        realtimeError instanceof Error ? realtimeError.message : t('chat.sendVoiceFailed')
+        realtimeError instanceof ServerMessageError
+          ? realtimeError.message
+          : t(VOICE_ERROR_KEYS[kind])
       return
     }
   }
@@ -2824,11 +2400,7 @@ async function sendVoiceMessage(audioBase64: string, format: string) {
     return
   }
 
-  if (abortController.value) {
-    abortController.value.abort()
-  }
-
-  abortController.value = new AbortController()
+  const request = beginReply()
 
   loading.value = true
   error.value = null
@@ -2837,7 +2409,7 @@ async function sendVoiceMessage(audioBase64: string, format: string) {
 
   // Use chatId if available to continue conversation
   const requestUrl = chatId.value
-    ? `${apiUrl.value}/public/chat/voice/${chatId.value}/stream`
+    ? `${apiUrl.value}/public/chat/voice/${encodeURIComponent(chatId.value)}/stream`
     : `${apiUrl.value}/public/chat/voice/stream`
 
   try {
@@ -2846,6 +2418,7 @@ async function sendVoiceMessage(audioBase64: string, format: string) {
     headers.set('Content-Type', 'application/json')
     headers.set('Accept', 'text/event-stream')
     headers.set('Accept-Language', widgetLocale.value)
+    for (const [name, value] of Object.entries(userIdHeaders())) headers.set(name, value)
 
     // Include session ID if available
     if (sessionId.value) {
@@ -2860,87 +2433,29 @@ async function sendVoiceMessage(audioBase64: string, format: string) {
         format,
       }),
       credentials: shouldIncludeCredentials.value ? 'include' : 'omit',
-      signal: abortController.value.signal,
+      signal: request.controller.signal,
     })
+    keepReplyAlive(request)
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ message: t('chat.unknownError') }))
-      throw new Error(errorData.message || `HTTP ${response.status}: ${response.statusText}`)
-    }
+    if (!response.ok) throw await errorFromResponse(response)
+    if (!response.body) throw new Error('Response has no body')
 
-    if (!response.body) {
-      throw new Error(t('chat.responseBodyNull'))
-    }
-
-    // Don't create assistant message upfront - wait for transcript event
-    // The assistant message will be created when content starts streaming
-
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-
-        if (done) {
-          // The done event handler should have already processed everything
-          // But ensure we clean up state if done event wasn't received
-          if (streamingAssistantIndex.value >= 0 && streamingContent.value) {
-            messages.value[streamingAssistantIndex.value].content = streamingContent.value
-          }
-          streamingAssistantIndex.value = -1
-          streamingContent.value = ''
-          break
-        }
-
-        if (abortController.value?.signal.aborted) {
-          reader.cancel()
-          break
-        }
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data: StreamEvent = JSON.parse(line.slice(6))
-              handleStreamEvent(data, true) // Pass true to indicate voice mode
-            } catch (parseError) {
-              console.warn('[ClearIdeasWidget] Failed to parse SSE event:', parseError)
-            }
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock()
-    }
+    // The assistant message is created when the transcript and content arrive.
+    await readReplyStream(request, response, data => processStreamData(data, true))
 
     // Switch to chat view if not already there
     if (currentView.value !== 'chat') {
       currentView.value = 'chat'
     }
   } catch (err) {
-    console.error('[ClearIdeasWidget] Voice message failed:', err)
+    if (isAbortError(err) && endAbortedReply(request)) return
 
-    if (err instanceof Error && err.name === 'AbortError') {
-      if (streamingAssistantIndex.value >= 0) {
-        messages.value.splice(streamingAssistantIndex.value, 1)
-      }
-      streamingAssistantIndex.value = -1
-      streamingContent.value = ''
-      cleanupVoiceRecording()
-      return
-    }
-
-    if (err instanceof TypeError && err.message === 'Failed to fetch') {
-      error.value = t('chat.corsError', { url: requestUrl })
-    } else if (err instanceof Error) {
-      error.value = err.message
+    if (request.reason === 'timeout') {
+      console.warn('[ClearIdeasWidget] No voice reply data for the reply timeout.')
+      error.value = t('chat.replyTimeout')
     } else {
-      error.value = t('chat.sendVoiceFailed')
+      console.error('[ClearIdeasWidget] Voice message failed:', err)
+      error.value = requestErrorMessage(err, 'chat.sendVoiceFailed')
     }
 
     if (streamingAssistantIndex.value >= 0) {
@@ -2949,8 +2464,8 @@ async function sendVoiceMessage(audioBase64: string, format: string) {
     }
     streamingContent.value = ''
   } finally {
-    loading.value = false
-    abortController.value = null
+    endReply(request)
+    if (!activeReply) loading.value = false
     cleanupVoiceRecording()
   }
 }
@@ -3001,11 +2516,6 @@ function handleAudioChunk(
     state.initSegmentReceived = true
   }
 
-  // Check if we should start progressive playback
-  const validChunks = state.audioChunks.filter((chunk: string | undefined): chunk is string =>
-    Boolean(chunk),
-  )
-
   // Start MediaSource when we receive the initialization segment (chunk 0 with isInitSegment flag)
   // Only start if MediaSource is not already initialized
   let shouldStart = false
@@ -3014,25 +2524,8 @@ function handleAudioChunk(
     shouldStart = !state.mediaSource && !state.isUsingProgressivePlayback
   }
 
-  console.log('[ClearIdeasWidget] Audio chunk received', {
-    messageIndex,
-    chunkIndex,
-    isInitSegment,
-    chunksCount: state.audioChunks.length,
-    validChunksCount: validChunks.length,
-    shouldStart,
-    hasMediaSource: !!state.mediaSource,
-    isUsingProgressivePlayback: state.isUsingProgressivePlayback,
-    isPlaying: state.isPlaying,
-    initSegmentReceived: state.initSegmentReceived,
-  })
-
   if (shouldStart) {
     // Start MediaSource-based progressive playback
-    console.log('[ClearIdeasWidget] Starting MediaSource playback', {
-      messageIndex,
-      chunksAvailable: validChunks.length,
-    })
     startProgressivePlayback(messageIndex)
   } else if (state.isUsingProgressivePlayback && state.sourceBuffer) {
     // Append chunk to existing MediaSource playback
@@ -3055,10 +2548,6 @@ function startProgressivePlayback(messageIndex: number) {
 
   // Ensure we have the initialization segment
   if (!state.initSegmentReceived) {
-    console.log(
-      '[ClearIdeasWidget] Waiting for initialization segment before starting MediaSource',
-      { messageIndex },
-    )
     return
   }
 
@@ -3110,14 +2599,10 @@ function startProgressivePlayback(messageIndex: number) {
 
   // Handle MediaSource ready
   mediaSource.addEventListener('sourceopen', () => {
-    console.log('[ClearIdeasWidget] MediaSource sourceopen event', {
-      messageIndex,
-    })
     try {
       // Create source buffer for WebM/Opus
       const sourceBuffer = mediaSource.addSourceBuffer('audio/webm; codecs="opus"')
       state.sourceBuffer = sourceBuffer
-      console.log('[ClearIdeasWidget] SourceBuffer created', { messageIndex })
 
       // Append initial chunks in order
       // For indexed chunks, we need to append in index order (0, 1, 2, ...)
@@ -3146,12 +2631,6 @@ function startProgressivePlayback(messageIndex: number) {
         }
       }
 
-      console.log('[ClearIdeasWidget] Preparing chunks for MediaSource', {
-        messageIndex,
-        totalChunks: chunks.length,
-        firstChunkSize: chunks[0] ? atob(chunks[0]).length : 0,
-      })
-
       // Initialize appended chunks count
       state.appendedChunksCount = 0
 
@@ -3171,11 +2650,6 @@ function startProgressivePlayback(messageIndex: number) {
               const binaryChunk = Uint8Array.from(atob(nextChunk), c => c.charCodeAt(0))
               sourceBuffer.appendBuffer(binaryChunk)
               state.appendedChunksCount!++
-              console.log('[ClearIdeasWidget] Appended chunk to MediaSource', {
-                messageIndex,
-                chunkIndex: state.appendedChunksCount! - 1,
-                totalChunks: state.audioChunks!.length,
-              })
               return true
             } catch (e) {
               console.error('[ClearIdeasWidget] Error appending chunk:', e, {
@@ -3196,12 +2670,7 @@ function startProgressivePlayback(messageIndex: number) {
           state.isPlaying = true
           audio
             .play()
-            .then(() => {
-              console.log('[ClearIdeasWidget] MediaSource playback started', {
-                messageIndex,
-                chunksAppended: state.appendedChunksCount,
-              })
-            })
+            .then(() => {})
             .catch(err => {
               console.warn('[ClearIdeasWidget] Failed to start MediaSource playback:', err)
               const currentState = messageAudioState.value.get(messageIndex)
@@ -3215,29 +2684,7 @@ function startProgressivePlayback(messageIndex: number) {
         // Try to append next chunk after current one finishes
         appendNextAvailableChunk()
 
-        // Check if we should end the stream (all chunks appended and complete audio received)
-        if (state.completeAudioReceived) {
-          const validChunksCount = state.audioChunks!.filter(
-            (chunk: string | undefined): chunk is string => Boolean(chunk),
-          ).length
-
-          if (
-            state.appendedChunksCount! >= validChunksCount &&
-            !sourceBuffer.updating &&
-            mediaSource.readyState === 'open'
-          ) {
-            try {
-              mediaSource.endOfStream()
-              console.log('[ClearIdeasWidget] MediaSource stream ended (all chunks appended)', {
-                messageIndex,
-                appendedChunks: state.appendedChunksCount,
-                validChunks: validChunksCount,
-              })
-            } catch (e) {
-              console.warn('[ClearIdeasWidget] Error ending MediaSource stream:', e)
-            }
-          }
-        }
+        endProgressiveStreamIfComplete(state)
       })
 
       // Start by appending the first available chunk (chunk 0)
@@ -3248,11 +2695,6 @@ function startProgressivePlayback(messageIndex: number) {
           messageIndex,
         })
       }
-
-      console.log('[ClearIdeasWidget] MediaSource playback initialized', {
-        messageIndex,
-        initialChunks: chunks.length,
-      })
     } catch (e) {
       console.error('[ClearIdeasWidget] Error creating source buffer:', e)
       state.isUsingProgressivePlayback = false
@@ -3275,13 +2717,9 @@ function startProgressivePlayback(messageIndex: number) {
   })
 
   // Log MediaSource state changes
-  mediaSource.addEventListener('sourceended', () => {
-    console.log('[ClearIdeasWidget] MediaSource sourceended', { messageIndex })
-  })
+  mediaSource.addEventListener('sourceended', () => {})
 
-  mediaSource.addEventListener('sourceclose', () => {
-    console.log('[ClearIdeasWidget] MediaSource sourceclose', { messageIndex })
-  })
+  mediaSource.addEventListener('sourceclose', () => {})
 }
 
 // Trigger appending of next chunk to MediaSource
@@ -3307,11 +2745,6 @@ function appendChunkToMediaSource(messageIndex: number, _base64Chunk: string) {
           const binaryChunk = Uint8Array.from(atob(nextChunk), c => c.charCodeAt(0))
           state.sourceBuffer.appendBuffer(binaryChunk)
           state.appendedChunksCount++
-          console.log('[ClearIdeasWidget] Triggered immediate chunk append', {
-            messageIndex,
-            chunkIndex: state.appendedChunksCount - 1,
-            totalChunks: state.audioChunks.length,
-          })
         } catch (e) {
           console.error('[ClearIdeasWidget] Error appending chunk:', e)
         }
@@ -3321,29 +2754,25 @@ function appendChunkToMediaSource(messageIndex: number, _base64Chunk: string) {
   // If sourceBuffer is updating, the updateend listener will handle it automatically
 }
 
-// End the MediaSource stream after all chunks are appended
-function appendRemainingChunksAndEndStream(messageIndex: number) {
-  const state = messageAudioState.value.get(messageIndex)
-  if (!state || !state.sourceBuffer || !state.mediaSource || !state.audioChunks) {
-    return
+/**
+ * Ends a progressive (MediaSource) stream once the complete audio has arrived and every chunk is
+ * appended. Without endOfStream() the element waits for more data and never fires `ended`.
+ */
+function endProgressiveStreamIfComplete(state: MessageAudioState) {
+  const { mediaSource, sourceBuffer, audioChunks } = state
+  if (!state.completeAudioReceived || !mediaSource || !sourceBuffer || !audioChunks) return
+  const chunkCount = audioChunks.filter(Boolean).length
+  if (
+    (state.appendedChunksCount ?? 0) >= chunkCount &&
+    !sourceBuffer.updating &&
+    mediaSource.readyState === 'open'
+  ) {
+    try {
+      mediaSource.endOfStream()
+    } catch (e) {
+      console.warn('[ClearIdeasWidget] Error ending MediaSource stream:', e)
+    }
   }
-
-  // Mark that complete audio has arrived
-  state.completeAudioReceived = true
-
-  console.log(
-    '[ClearIdeasWidget] Complete audio received, will end stream after all chunks appended',
-    {
-      messageIndex,
-      appendedChunks: state.appendedChunksCount,
-      totalChunks: state.audioChunks.length,
-      sourceBufferUpdating: state.sourceBuffer.updating,
-      mediaSourceState: state.mediaSource.readyState,
-    },
-  )
-
-  // The updateend listener in startProgressivePlayback will check this flag and end the stream
-  // when all chunks are appended. We don't add a competing listener here.
 }
 
 // Audio playback functions are now provided by useAudioPlayback composable
@@ -3358,143 +2787,29 @@ function getMessageAudioDuration(index: number): number {
   return messageAudioState.value.get(index)?.duration || 0
 }
 
-// Watch for audio state changes to update tooltips
-watch(
-  () => messages.value.map((_: ChatMessage, index: number) => isMessageAudioPlaying(index)),
-  () => {
-    nextTick(() => {
-      audioBtnRefs.value.forEach((element: HTMLElement, index: number) => {
-        if (element && tippyInstances.value.has(element)) {
-          const instance = tippyInstances.value.get(element)
-          instance?.setContent(isMessageAudioPlaying(index) ? t('audio.pause') : t('audio.play'))
-        }
-      })
-    })
-  },
-  { deep: true },
-)
+// Move the session ID between sessionStorage and localStorage when consent changes.
+watch(resolvedConsentGranted, async (granted, wasGranted) => {
+  if (!resolvedConsentRequired.value || granted === wasGranted) return
+  clearCachedInitData()
+  const key = storageKeyFor('session')
+  const local = getBrowserStorage('local')
+  const session = getBrowserStorage('session')
 
-// Watch for isOpen changes to update FAB tooltip
-watch(isOpen, () => {
-  nextTick(() => {
-    if (fabBtnRef.value && tippyInstances.value.has(fabBtnRef.value)) {
-      const instance = tippyInstances.value.get(fabBtnRef.value)
-      instance?.setContent(isOpen.value ? t('fab.closeChat') : t('fab.openChat'))
+  if (granted) {
+    const stored = readItem(session, key)
+    if (stored && stored === sessionId.value) {
+      writeItem(local, key, stored)
+      removeItem(session, key)
+      // Re-initialize so the server can set its cookie for this session.
+      await loadInitData()
     }
-  })
-})
-
-// Watch for consentGranted changes to handle migration between storage types
-watch(resolvedConsentGranted, async (newValue, oldValue) => {
-  if (typeof window === 'undefined') {
-    return
-  }
-
-  // Handle transition from false to true (consent granted)
-  if (oldValue === false && newValue === true && resolvedConsentRequired.value === true) {
-    // Clear cached init data - consent state changed
-    clearCachedInitData()
-    // Migrate sessionId from sessionStorage to localStorage if it exists
-    if (sessionId.value) {
-      const sessionIdFromSessionStorage = sessionStorage.getItem('clearideasPublicChatSessionId')
-      if (sessionIdFromSessionStorage && sessionIdFromSessionStorage === sessionId.value) {
-        try {
-          // Migrate to localStorage
-          localStorage.setItem('clearideasPublicChatSessionId', sessionId.value)
-          sessionStorage.removeItem('clearideasPublicChatSessionId')
-          debugLog(
-            '[ClearIdeasWidget] Migrated session ID from sessionStorage to localStorage:',
-            sessionId.value,
-          )
-
-          // Re-initialize to establish cookie for existing session
-          await loadInitData()
-        } catch (err) {
-          debugWarn('[ClearIdeasWidget] Failed to migrate session ID to localStorage:', err)
-          // Continue - session ID remains in sessionStorage
-        }
-      }
-    }
-  }
-
-  // Handle transition from true to false (consent denied/revoked)
-  if (oldValue === true && newValue === false && resolvedConsentRequired.value === true) {
-    // Clear cached init data - consent state changed
-    clearCachedInitData()
-    // Move sessionId from localStorage to sessionStorage if it exists
-    if (sessionId.value) {
-      const sessionIdFromLocalStorage = localStorage.getItem('clearideasPublicChatSessionId')
-      if (sessionIdFromLocalStorage && sessionIdFromLocalStorage === sessionId.value) {
-        try {
-          // Migrate to sessionStorage
-          sessionStorage.setItem('clearideasPublicChatSessionId', sessionId.value)
-          localStorage.removeItem('clearideasPublicChatSessionId')
-          debugLog(
-            '[ClearIdeasWidget] Migrated session ID from localStorage to sessionStorage (consent revoked):',
-            sessionId.value,
-          )
-        } catch (err) {
-          debugWarn('[ClearIdeasWidget] Failed to migrate session ID to sessionStorage:', err)
-          // Continue - session ID remains in localStorage
-        }
-      }
-    } else {
-      // If no sessionId in memory, clean up any leftover localStorage entry
-      const leftoverSessionId = localStorage.getItem('clearideasPublicChatSessionId')
-      if (leftoverSessionId) {
-        localStorage.removeItem('clearideasPublicChatSessionId')
-        debugLog(
-          '[ClearIdeasWidget] Removed leftover session ID from localStorage (consent revoked)',
-        )
-      }
-    }
+  } else {
+    // Consent revoked: nothing may remain in persistent storage.
+    const stored = readItem(local, key)
+    if (stored && stored === sessionId.value) writeItem(session, key, stored)
+    removeItem(local, key)
   }
 })
-
-// Duration formatting is now in utils/duration.ts
-// Voice recording support is now provided by useVoiceRecording composable
-
-// Remove auto-switch to chat - user must manually click chat action
-// watch(
-//   () => messages.value.length,
-//   len => {
-//     if (len > 0) currentView.value = 'chat'
-//   },
-// )
-
-// Click handler for chat-source elements
-function addClickEventListener() {
-  if (messageContentContainer.value) {
-    messageContentContainer.value.addEventListener('click', (event: MouseEvent) => {
-      const target = event.target as HTMLElement
-      if (target.classList.contains('chat-source')) {
-        event.preventDefault()
-        // Use data-original-url first (external link), then fall back to href
-        const href = target.getAttribute('data-original-url') || target.getAttribute('href')
-        if (href) {
-          window.open(href, '_blank', 'noopener,noreferrer')
-        }
-      }
-    })
-  }
-}
-
-// Initialize tippy tooltips for chat-source elements
-function initializeTippy() {
-  if (messageContentContainer.value) {
-    const tippyElements = messageContentContainer.value.querySelectorAll('.chat-source')
-    tippyElements.forEach((element: Element) => {
-      const tippyContent = element.getAttribute('data-tippy-content')
-      if (tippyContent) {
-        tippy(element, {
-          content: tippyContent,
-          allowHTML: true,
-          placement: 'top',
-        })
-      }
-    })
-  }
-}
 
 // Auto-scroll to bottom when messages update
 const messagesContainer = ref<HTMLElement | null>(null)
@@ -3505,36 +2820,13 @@ watch(
       if (messagesContainer.value) {
         messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
       }
-      addClickEventListener()
-      initializeTippy()
-      initializeButtonTooltips()
-    })
-  },
-  { deep: true },
-)
-
-watch(
-  () => streamingContent.value,
-  () => {
-    nextTick(() => {
-      addClickEventListener()
-      initializeTippy()
-      initializeButtonTooltips()
     })
   },
 )
 
-// Watch for recording state changes to initialize tooltips for recording buttons
-watch(isRecording, () => {
-  nextTick(() => {
-    initializeButtonTooltips()
-  })
-})
-
-// Watch for view changes to initialize tooltips when buttons appear
+// Show or hide the disclaimer dialog when the view changes
 watch(currentView, newView => {
   nextTick(() => {
-    initializeButtonTooltips()
     // Check for disclaimer dialog when switching to chat view
     if (newView === 'chat') {
       checkAndShowDisclaimerDialog()
@@ -3557,31 +2849,46 @@ watch(currentView, newView => {
 <template>
   <div
     class="ci-widget"
+    :lang="widgetLocale"
+    :dir="widgetDir"
     :class="[positionClass, { 'ci-widget-dark': isDarkMode }]"
-    :style="{ ...absoluteStyle, ...widgetContainerStyle }"
+    :style="{ ...accentStyle, ...absoluteStyle, ...widgetContainerStyle }"
+    @keydown="handleKeydown"
   >
+    <!-- lang and dir above make screen readers, fonts and layout follow the widget language. -->
     <Transition name="ci-widget-scale-fade">
-      <div v-if="isOpen" class="ci-widget-panel ci-widget-card" :style="panelStyle">
+      <!-- A non-modal dialog: the page stays usable while the chat is open. -->
+      <div
+        v-if="isOpen"
+        :id="panelId"
+        ref="panelRef"
+        class="ci-widget-panel ci-widget-card"
+        role="dialog"
+        :aria-label="widgetChatName"
+        :style="panelStyle"
+      >
         <!-- Disclaimer Dialog Overlay -->
         <Transition name="ci-widget-fade">
           <div
-            v-if="
-              showDisclaimerDialog &&
-              initData?.disclaimerDialogEnabled &&
-              initData?.disclaimerDialogText &&
-              currentView === 'chat'
-            "
+            v-if="disclaimerDialogVisible"
             class="ci-widget-disclaimer-dialog-overlay"
             @click.self="dismissDisclaimerDialog"
           >
-            <div class="ci-widget-disclaimer-dialog">
+            <div
+              class="ci-widget-disclaimer-dialog"
+              role="dialog"
+              aria-modal="true"
+              :aria-label="t('disclaimerDialog.label')"
+            >
+              <!-- Focusable so keyboard users can scroll it (the button needs a full read). -->
               <div
                 ref="disclaimerDialogContentRef"
                 class="ci-widget-disclaimer-dialog__content"
+                tabindex="0"
                 @scroll="checkDisclaimerDialogScroll"
               >
-                <div class="ci-widget-disclaimer-dialog__text">
-                  {{ initData.disclaimerDialogText }}
+                <div class="ci-widget-disclaimer-dialog__text" dir="auto">
+                  {{ initData?.disclaimerDialogText }}
                 </div>
                 <!-- Scroll indicator -->
                 <div
@@ -3615,6 +2922,7 @@ watch(currentView, newView => {
           </div>
         </Transition>
         <WidgetHeader
+          :inert="disclaimerDialogVisible || undefined"
           :current-view="currentView"
           :init-data="initData"
           :widget-chat-name="widgetChatName"
@@ -3625,10 +2933,12 @@ watch(currentView, newView => {
           :display-name="displayName"
           @go-home="goToHome"
           @close="closeWidget"
-          @back-btn-ref="setBackBtnRef"
-          @close-btn-ref="setCloseBtnRef"
         />
-        <div ref="messagesContainer" class="ci-widget-panel__body">
+        <div
+          ref="messagesContainer"
+          class="ci-widget-panel__body"
+          :inert="disclaimerDialogVisible || undefined"
+        >
           <Transition name="ci-widget-view-fade">
             <RealtimeVoiceView
               v-if="realtimeVoiceModeOpen"
@@ -3641,6 +2951,8 @@ watch(currentView, newView => {
               :widget-color="widgetColor"
               :caption="realtimeVoiceCaption"
               :has-user-spoken="realtimeUserHasSpoken"
+              :error="error"
+              :can-use-recorded="supportsVoiceRecording && !microphoneProblem"
               @toggle-mute="toggleRealtimeMuted"
               @end="endRealtimeVoiceMode"
               @use-recorded="useRecordedVoiceFallback"
@@ -3656,95 +2968,106 @@ watch(currentView, newView => {
 
             <div v-else key="chat">
               <!-- Messages display -->
-              <div class="ci-widget-messages" ref="messageContentContainer">
-                <!-- AI Disclaimer -->
-                <div class="ci-widget-disclaimer">
-                  <span
-                    class="ci-widget-icon"
-                    v-html="getIconSVG('triangleExclamation', 14)"
-                  ></span>
-                  <span>
-                    {{ initData?.disclaimerText || t('chat.disclaimer') }}
-                  </span>
-                </div>
-                <!-- Initial greeting message -->
-                <!-- Show for new chats until an existing chat is restored or a conversation starts -->
-                <ChatMessageComponent
-                  v-if="isNewChat && !loadingInit && initData?.initialMessage"
-                  :key="'initial'"
-                  :message="{
-                    role: 'assistant',
-                    content: initData.initialMessage || '',
-                    createdAt: new Date(),
-                  }"
-                  :index="-1"
-                  :widget-color="widgetColor"
-                  :is-playing="false"
-                  :current-time="0"
-                  :duration="0"
-                  :progress="0"
-                  @toggle="() => {}"
-                  @seek="() => {}"
-                  @audio-btn-ref="() => {}"
-                />
-                <!-- Regular messages from existing chat or new messages -->
-                <ChatMessageComponent
-                  v-for="(message, index) in messages"
-                  :key="`msg-${index}`"
-                  :message="message"
-                  :index="index"
-                  :widget-color="widgetColor"
-                  :is-playing="isMessageAudioPlaying(index)"
-                  :current-time="getMessageAudioCurrentTime(index)"
-                  :duration="getMessageAudioDuration(index)"
-                  :progress="getMessageAudioProgress(index)"
-                  @toggle="toggleMessageAudio"
-                  @seek="setMessageAudioTime"
-                  @audio-btn-ref="
-                    (idx, el) => {
-                      if (el) {
-                        audioBtnRefs.set(idx, el)
-                        nextTick(() => initializeButtonTooltips())
-                      }
-                    }
-                  "
-                />
-                <!-- Show generating indicator throughout entire stream -->
+              <div class="ci-widget-messages">
+                <!--
+                  The conversation is a polite live region: screen readers announce new messages.
+                  It is busy while a reply streams, so the finished reply is announced once.
+                -->
                 <div
-                  v-if="loading || streamingAssistantIndex >= 0"
-                  class="ci-widget-message ci-widget-message--assistant"
+                  class="ci-widget-log"
+                  role="log"
+                  aria-live="polite"
+                  :aria-label="t('chat.conversation')"
+                  :aria-busy="replyInProgress ? 'true' : 'false'"
                 >
-                  <div class="generating-item">
-                    <div class="generating-standalone">
-                      <div class="generating-indicator">
-                        <div class="generating-animation">
-                          <div class="dot"></div>
-                          <div class="dot"></div>
-                          <div class="dot"></div>
+                  <!-- AI Disclaimer -->
+                  <div class="ci-widget-disclaimer">
+                    <span
+                      class="ci-widget-icon"
+                      v-html="getIconSVG('triangleExclamation', 14)"
+                    ></span>
+                    <span dir="auto">
+                      {{ initData?.disclaimerText || t('chat.disclaimer') }}
+                    </span>
+                  </div>
+                  <!-- Initial greeting message -->
+                  <!-- Show for new chats until an existing chat is restored or a conversation starts -->
+                  <ChatMessageComponent
+                    v-if="isNewChat && !loadingInit && initData?.initialMessage"
+                    :key="'initial'"
+                    :message="{
+                      role: 'assistant',
+                      content: initData.initialMessage || '',
+                      createdAt: new Date(),
+                    }"
+                    :index="-1"
+                    :widget-color="widgetColor"
+                    :is-playing="false"
+                    :current-time="0"
+                    :duration="0"
+                    :progress="0"
+                    @toggle="() => {}"
+                    @seek="() => {}"
+                  />
+                  <!-- Regular messages from existing chat or new messages -->
+                  <ChatMessageComponent
+                    v-for="(message, index) in messages"
+                    :key="`msg-${index}`"
+                    :message="message"
+                    :index="index"
+                    :widget-color="widgetColor"
+                    :is-playing="isMessageAudioPlaying(index)"
+                    :current-time="getMessageAudioCurrentTime(index)"
+                    :duration="getMessageAudioDuration(index)"
+                    :progress="getMessageAudioProgress(index)"
+                    @toggle="toggleMessageAudio"
+                    @seek="setMessageAudioTime"
+                  />
+                  <!-- Show generating indicator throughout entire stream -->
+                  <div
+                    v-if="replyInProgress"
+                    class="ci-widget-message ci-widget-message--assistant"
+                    aria-hidden="true"
+                  >
+                    <div class="generating-item">
+                      <div class="generating-standalone">
+                        <div class="generating-indicator">
+                          <div class="generating-animation">
+                            <div class="dot"></div>
+                            <div class="dot"></div>
+                            <div class="dot"></div>
+                          </div>
                         </div>
                       </div>
                     </div>
                   </div>
                 </div>
-                <div v-if="error" class="ci-widget-message ci-widget-message--error">
+                <div v-if="error" class="ci-widget-message ci-widget-message--error" role="alert">
                   <div class="ci-widget-message__content">
                     <span
                       class="ci-widget-icon"
                       v-html="getIconSVG('triangleExclamation', 16)"
                     ></span>
-                    <span>{{ error }}</span>
+                    <span dir="auto">{{ error }}</span>
                   </div>
                 </div>
               </div>
             </div>
           </Transition>
+          <!-- Announces that a reply is on its way (the animated dots are hidden from screen readers). -->
+          <div class="ci-sr-only" role="status">
+            {{ replyInProgress ? t('chat.typing') : '' }}
+          </div>
         </div>
-        <div v-if="!realtimeVoiceModeOpen" class="ci-widget-panel__footer">
+        <div
+          v-if="!realtimeVoiceModeOpen"
+          class="ci-widget-panel__footer"
+          :inert="disclaimerDialogVisible || undefined"
+        >
           <template v-if="currentView === 'chat'">
             <ChatInput
               ref="chatInputRef"
               v-model="chatInputContent"
-              :disabled="loading"
               :loading="loading"
               :is-recording="voiceInputActive"
               :recording-duration="voiceInputDuration"
@@ -3753,19 +3076,15 @@ watch(currentView, newView => {
               :supports-voice-recording="supportsAnyVoice"
               :expanded="chatInputExpanded"
               @send="trySendChatInput"
+              @stop="stopReply"
               @start-recording="startRecording"
               @stop-recording="completeVoiceInput"
               @cancel-recording="cancelVoiceInput"
               @focus="chatInputFocused = true"
               @blur="chatInputFocused = false"
-              @voice-btn-ref="setVoiceBtnRef"
-              @send-btn-ref="setSendBtnRef"
-              @cancel-btn-ref="setCancelBtnRef"
-              @accept-btn-ref="setAcceptBtnRef"
             />
             <div v-if="chatId && messages.length > 0" class="ci-widget-new-chat-wrapper">
               <button
-                ref="newChatBtnRef"
                 class="ci-widget-new-chat-btn"
                 @click="startNewChat"
                 :aria-label="t('chat.newChatAria')"
@@ -3802,13 +3121,29 @@ watch(currentView, newView => {
     </Transition>
 
     <WidgetFAB
-      v-if="fabVisible"
+      v-if="launcherShown"
+      ref="fabRef"
+      :expanded="isOpen"
+      :controls="panelId"
       :is-open="isOpen"
       :widget-color="widgetColor"
       :fab-size="props.fabSize"
       @toggle="toggleWidget"
-      @fab-btn-ref="setFabBtnRef"
+      :tooltip-placement="currentWidgetPosition.endsWith('left') ? 'right' : 'left'"
     />
+
+    <!-- Shown after opening failed; announced to screen readers. -->
+    <Transition name="hello-bubble">
+      <div
+        v-if="unavailableNoticeVisible"
+        class="ci-widget-notice"
+        :style="{ ...helloBubbleStyle, width: 'max-content', maxWidth: '280px' }"
+        role="alert"
+        dir="auto"
+      >
+        {{ t('chat.unavailable') }}
+      </div>
+    </Transition>
 
     <!-- Hello Bubble -->
     <Transition name="hello-bubble">
@@ -3818,22 +3153,18 @@ watch(currentView, newView => {
         :style="helloBubbleStyle"
         @click="hideHelloBubble"
       >
-        <div
-          class="ci-widget-hello-bubble__content"
-          :style="{
-            background: `linear-gradient(135deg, ${widgetColor} 0%, ${adjustColorLightness(widgetColor, -15)} 100%)`,
-            boxShadow: `0 8px 24px ${hexToRgba(widgetColor, 0.4)}, 0 4px 12px rgba(0, 0, 0, 0.15)`,
-          }"
-        >
-          <div
-            v-if="initData?.iconUrl"
-            class="ci-widget-hello-bubble__icon"
-            v-html="
-              `<img src='${initData.iconUrl}' alt='' style='width: 24px; height: 24px; object-fit: contain;' />`
-            "
-          ></div>
+        <div class="ci-widget-hello-bubble__content">
+          <div v-if="initData?.iconUrl" class="ci-widget-hello-bubble__icon">
+            <img
+              :src="initData.iconUrl"
+              alt=""
+              width="24"
+              height="24"
+              style="object-fit: contain"
+            />
+          </div>
           <div v-else class="ci-widget-hello-bubble__icon" v-html="getIconSVG('ciIcon', 24)"></div>
-          <div class="ci-widget-hello-bubble__text">{{ helloBubbleText }}</div>
+          <div class="ci-widget-hello-bubble__text" dir="auto">{{ helloBubbleText }}</div>
           <button
             class="ci-widget-hello-bubble__close"
             @click.stop="hideHelloBubble"
@@ -3859,6 +3190,31 @@ watch(currentView, newView => {
   --ci-widget-border-opacity: 0.24;
   --ci-widget-medium-emphasis-opacity: 0.8;
   --ci-widget-high-emphasis-opacity: 0.9;
+  /* Not set by the base variables above: error and secondary tones. */
+  --ci-widget-error: 229, 57, 53;
+  /* Error text: darker than the error tone so it meets 4.5:1 on its tinted background. */
+  --ci-widget-error-text: 183, 28, 28;
+  --ci-widget-secondary: 163, 177, 198;
+  /*
+   * Own typography instead of inheriting the page's (in Shadow DOM the page's inherited styles stop
+   * at the host). Pages can set --ci-widget-font-family to match their font.
+   */
+  font-family: var(
+    --ci-widget-font-family,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif
+  );
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: normal;
+  text-align: start;
+  text-transform: none;
   position: fixed;
   z-index: 2100;
   color: rgb(var(--ci-widget-on-surface));
@@ -3893,6 +3249,21 @@ watch(currentView, newView => {
 /* FAB button styles moved to WidgetFAB.vue component */
 
 /* Hello Bubble */
+/* "Chat is unavailable" notice, placed like the hello bubble. */
+.ci-widget-notice {
+  position: absolute;
+  z-index: 2200;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid rgba(var(--ci-widget-on-surface), 0.12);
+  border-radius: 12px;
+  background: rgb(var(--ci-widget-surface));
+  color: rgb(var(--ci-widget-on-surface));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
 .ci-widget-hello-bubble {
   position: absolute;
   /* Positioning is set dynamically via inline styles based on widget position */
@@ -3902,8 +3273,15 @@ watch(currentView, newView => {
 }
 
 .ci-widget-hello-bubble__content {
-  /* Background and box-shadow are set dynamically via inline styles */
-  color: white;
+  background: linear-gradient(
+    135deg,
+    var(--ci-widget-accent) 0%,
+    var(--ci-widget-accent-strong) 100%
+  );
+  box-shadow:
+    0 8px 24px rgba(var(--ci-widget-accent-rgb), 0.4),
+    0 4px 12px rgba(0, 0, 0, 0.15);
+  color: var(--ci-widget-on-accent);
   padding: 14px 16px;
   border-radius: 16px;
   display: flex;
@@ -3939,15 +3317,17 @@ watch(currentView, newView => {
 
 .ci-widget-hello-bubble__text {
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-weight: 500;
-  color: white;
+  color: inherit;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
 .ci-widget-hello-bubble__close {
   background: rgba(255, 255, 255, 0.2);
   border: none;
-  color: white;
+  color: inherit;
   width: 24px;
   height: 24px;
   border-radius: 50%;
@@ -4050,6 +3430,9 @@ watch(currentView, newView => {
   --ci-widget-on-background: 255, 255, 255;
   --ci-widget-border-color: 234, 234, 234;
   --ci-widget-border-opacity: 0.12;
+  --ci-widget-error: 211, 47, 47;
+  --ci-widget-error-text: 255, 138, 128;
+  --ci-widget-secondary: 107, 124, 145;
   color: rgb(var(--ci-widget-on-surface));
   color-scheme: dark;
 }
@@ -4120,8 +3503,8 @@ watch(currentView, newView => {
 }
 
 .ci-widget.ci-widget-dark .consumer-input__accept-btn {
-  background: rgb(var(--ci-widget-feature)) !important;
-  background-color: rgb(var(--ci-widget-feature)) !important;
+  background: var(--ci-widget-accent) !important;
+  background-color: var(--ci-widget-accent) !important;
 }
 
 .ci-widget.ci-widget-dark .ci-widget-audio-btn {
@@ -4327,7 +3710,7 @@ watch(currentView, newView => {
 }
 
 .ci-widget.ci-widget-dark .consumer-input__voice-btn {
-  border-left: 1px solid rgba(234, 234, 234, 0.12) !important;
+  border-inline-start: 1px solid rgba(234, 234, 234, 0.12) !important;
   color: rgb(255, 255, 255) !important;
 }
 
@@ -4430,9 +3813,24 @@ watch(currentView, newView => {
   transform: translateX(-10px);
 }
 
+/* Views slide the other way in right-to-left languages. */
+.ci-widget[dir='rtl'] .ci-widget-view-fade-enter-from {
+  transform: translateX(-10px);
+}
+
+.ci-widget[dir='rtl'] .ci-widget-view-fade-leave-to {
+  transform: translateX(10px);
+}
+
 /* Home view and action styles moved to WidgetHeader.vue and WidgetHomeView.vue components */
 
 /* Messages container styling */
+.ci-widget-log {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 .ci-widget-messages {
   padding: 16px;
   display: flex;
@@ -4452,7 +3850,7 @@ watch(currentView, newView => {
   padding: 2px 0;
   font-size: 11px;
   line-height: 1.5;
-  color: rgba(var(--ci-widget-secondary, 163, 177, 198), 0.7);
+  color: rgba(var(--ci-widget-on-surface), 0.7);
 }
 
 .ci-widget-disclaimer .ci-widget-icon {
@@ -4467,13 +3865,10 @@ watch(currentView, newView => {
   flex: 1;
 }
 
-/* Dark mode disclaimer */
-.ci-widget.ci-widget-dark .ci-widget-disclaimer {
-  color: rgba(var(--ci-widget-secondary, 107, 124, 145), 0.8) !important;
-}
-
+/* Dark mode disclaimer (on-surface is light in dark mode) */
+.ci-widget.ci-widget-dark .ci-widget-disclaimer,
 .ci-widget.ci-widget-dark .ci-widget-disclaimer .ci-widget-icon {
-  color: rgba(var(--ci-widget-secondary, 107, 124, 145), 0.8) !important;
+  color: rgba(var(--ci-widget-on-surface), 0.7) !important;
 }
 
 /* Disclaimer Dialog Overlay */
@@ -4534,7 +3929,7 @@ watch(currentView, newView => {
   border-radius: 6px;
   font-size: 14px;
   font-weight: 600;
-  color: #ffffff;
+  color: var(--ci-widget-on-accent);
   cursor: pointer;
   transition: opacity 0.2s;
 }
@@ -4647,9 +4042,9 @@ watch(currentView, newView => {
   width: var(--size);
   height: var(--size);
   border-radius: 50%;
-  background: rgba(var(--ci-widget-feature), 0.8);
+  background: rgba(var(--ci-widget-accent-rgb), 0.8);
   animation: dotWave 1.2s cubic-bezier(0.45, 0, 0.55, 1) infinite;
-  box-shadow: 0 0 0 rgba(var(--ci-widget-feature), 0);
+  box-shadow: 0 0 0 rgba(var(--ci-widget-accent-rgb), 0);
 }
 
 .generating-animation .dot:nth-child(1) {
@@ -4668,22 +4063,22 @@ watch(currentView, newView => {
   0%,
   100% {
     transform: translateY(0) scale(0.9);
-    box-shadow: 0 0 0 rgba(var(--ci-widget-feature), 0);
+    box-shadow: 0 0 0 rgba(var(--ci-widget-accent-rgb), 0);
     opacity: 0.6;
   }
   25% {
     transform: translateY(-6px) scale(1);
-    box-shadow: 0 0 3px rgba(var(--ci-widget-feature), 0.6);
+    box-shadow: 0 0 3px rgba(var(--ci-widget-accent-rgb), 0.6);
     opacity: 1;
   }
   50% {
     transform: translateY(0) scale(0.9);
-    box-shadow: 0 0 0 rgba(var(--ci-widget-feature), 0);
+    box-shadow: 0 0 0 rgba(var(--ci-widget-accent-rgb), 0);
     opacity: 0.6;
   }
   75% {
     transform: translateY(3px) scale(0.85);
-    box-shadow: 0 0 3px rgba(var(--ci-widget-feature), 0.3);
+    box-shadow: 0 0 3px rgba(var(--ci-widget-accent-rgb), 0.3);
     opacity: 0.7;
   }
 }
@@ -4699,6 +4094,126 @@ watch(currentView, newView => {
 </style>
 
 <style>
+/* Arrows point the other way in right-to-left languages (icons are v-html, so unscoped). */
+.ci-widget[dir='rtl'] .ci-widget-icon--mirror svg {
+  transform: scaleX(-1);
+}
+
+/* Visually hidden, but read by screen readers. */
+.ci-widget .ci-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Visible keyboard focus on every control. */
+.ci-widget :is(button, a, [tabindex]):focus-visible {
+  outline: 2px solid var(--ci-widget-accent-text, #2866cf);
+  outline-offset: 2px;
+}
+
+/* Respect the system "reduce motion" setting. */
+@media (prefers-reduced-motion: reduce) {
+  .ci-widget *,
+  .ci-widget *::before,
+  .ci-widget *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/*
+ * Tooltips: CSS only. Elements opt in with data-tooltip="text" and optionally
+ * data-tooltip-placement="top|bottom|left|right" and data-tooltip-align="start|end"
+ * (keeps tooltips on edge buttons inside the panel). The text is an attribute value rendered with
+ * attr(), so it is never interpreted as markup.
+ */
+.ci-widget [data-tooltip] {
+  position: relative;
+}
+
+.ci-widget .ci-widget-fab[data-tooltip] {
+  position: absolute;
+}
+
+.ci-widget [data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  z-index: 10;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(33, 33, 33, 0.92);
+  color: #fff;
+  font:
+    500 12px/1.3 system-ui,
+    -apple-system,
+    sans-serif;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.15s ease,
+    visibility 0.15s;
+}
+
+.ci-widget [data-tooltip]:hover::after,
+.ci-widget [data-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0.3s;
+}
+
+.ci-widget [data-tooltip-placement='bottom']::after {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+
+.ci-widget [data-tooltip-placement='left']::after,
+.ci-widget [data-tooltip-placement='right']::after {
+  bottom: auto;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.ci-widget [data-tooltip-placement='left']::after {
+  left: auto;
+  right: calc(100% + 8px);
+}
+
+.ci-widget [data-tooltip-placement='right']::after {
+  left: calc(100% + 8px);
+}
+
+/* Start and end follow the text direction, so edge tooltips stay inside the panel in RTL too. */
+.ci-widget [data-tooltip-align='start']::after {
+  left: auto;
+  inset-inline-start: 0;
+  transform: none;
+}
+
+.ci-widget [data-tooltip-align='end']::after {
+  left: auto;
+  inset-inline-end: 0;
+  transform: none;
+}
+
+.ci-widget [data-tooltip]:not(:hover):not(:focus-visible)::after {
+  transition-delay: 0s;
+}
 /* Markdown tables are rendered inside the child message component. */
 .ci-widget.ci-widget-dark .ci-widget-message__text th {
   background: rgb(31, 31, 31) !important;
@@ -4715,7 +4230,7 @@ watch(currentView, newView => {
 
 .ci-widget-message--error .ci-widget-message__content {
   background: rgba(var(--ci-widget-error), 0.1);
-  color: rgb(var(--ci-widget-error));
+  color: rgb(var(--ci-widget-error-text));
   border-radius: 8px;
   border: 1px solid rgba(var(--ci-widget-error), 0.3);
   display: flex;

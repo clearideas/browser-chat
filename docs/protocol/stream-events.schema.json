@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/clearideas/chat/docs/protocol/stream-events.schema.json",
+  "title": "Public Chat Protocol v1 stream event",
+  "description": "Payload of one Server-Sent Event `data:` line. Clients must ignore event types they do not recognize and unknown properties. See README §6.",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": { "type": "string" }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/info" },
+    { "$ref": "#/$defs/transcript" },
+    { "$ref": "#/$defs/content" },
+    { "$ref": "#/$defs/thinking" },
+    { "$ref": "#/$defs/toolCall" },
+    { "$ref": "#/$defs/toolCallComplete" },
+    { "$ref": "#/$defs/message_finalized" },
+    { "$ref": "#/$defs/audioChunk" },
+    { "$ref": "#/$defs/audio" },
+    { "$ref": "#/$defs/done" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "chatIdField": {
+      "description": "Chat ID. Servers should send `chatId`; older servers send `id`. At least one must be present.",
+      "anyOf": [{ "required": ["chatId"] }, { "required": ["id"] }]
+    },
+    "message": {
+      "type": "object",
+      "required": ["role", "content"],
+      "properties": {
+        "role": { "enum": ["user", "assistant"] },
+        "content": {
+          "type": "string",
+          "description": "Markdown (untrusted, see README §7)."
+        }
+      }
+    },
+    "info": {
+      "description": "First event. Identifies the chat.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "info" },
+        "chatId": { "type": "string" },
+        "id": { "type": "string" },
+        "isNewChat": { "type": "boolean" },
+        "chatName": { "type": "string" }
+      },
+      "allOf": [{ "$ref": "#/$defs/chatIdField" }]
+    },
+    "transcript": {
+      "description": "Voice only. Recognized visitor speech, sent once after speech-to-text.",
+      "type": "object",
+      "required": ["type", "transcript"],
+      "properties": {
+        "type": { "const": "transcript" },
+        "transcript": { "type": "string" }
+      }
+    },
+    "content": {
+      "description": "Text delta of the assistant reply. Deltas are concatenated in order.",
+      "type": "object",
+      "required": ["type", "content"],
+      "properties": {
+        "type": { "const": "content" },
+        "content": { "type": "string" }
+      }
+    },
+    "thinking": {
+      "description": "Optional model reasoning text. The v1 widget ignores it.",
+      "type": "object",
+      "required": ["type", "thinking"],
+      "properties": {
+        "type": { "const": "thinking" },
+        "thinking": { "type": "string" }
+      }
+    },
+    "toolCall": {
+      "description": "Informational: the model invoked a server-side tool. The v1 widget ignores it.",
+      "type": "object",
+      "required": ["type", "toolCall"],
+      "properties": {
+        "type": { "const": "toolCall" },
+        "toolCall": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "function": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "arguments": {
+                  "type": "string",
+                  "description": "JSON-encoded arguments."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "toolCallComplete": {
+      "description": "Informational: a tool call finished. The v1 widget ignores it.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "toolCallComplete" }
+      }
+    },
+    "message_finalized": {
+      "description": "Complete assistant message. Replaces the concatenated deltas.",
+      "type": "object",
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "const": "message_finalized" },
+        "message": { "$ref": "#/$defs/message" }
+      }
+    },
+    "audioChunk": {
+      "description": "Voice only. Base64 WebM/Opus fragment for progressive playback. The first chunk is the initialization segment.",
+      "type": "object",
+      "required": ["type", "audioChunk"],
+      "properties": {
+        "type": { "const": "audioChunk" },
+        "audioChunk": { "type": "string", "contentEncoding": "base64" },
+        "audioChunkIndex": { "type": "integer", "minimum": 0 },
+        "isInitSegment": { "type": "boolean" }
+      }
+    },
+    "audio": {
+      "description": "Voice only. Complete base64 WebM/Opus reply audio.",
+      "type": "object",
+      "required": ["type", "audio"],
+      "properties": {
+        "type": { "const": "audio" },
+        "audio": { "type": "string", "contentEncoding": "base64" }
+      }
+    },
+    "done": {
+      "description": "Last event of a successful stream. Text chat carries `message`; voice carries `transcript`, `response` and `audio`.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "done" },
+        "chatId": { "type": "string" },
+        "id": { "type": "string" },
+        "chatName": { "type": "string" },
+        "message": { "$ref": "#/$defs/message" },
+        "transcript": { "type": "string" },
+        "response": { "type": "string" },
+        "audio": { "type": "string", "contentEncoding": "base64" },
+        "traceId": { "type": "string" }
+      },
+      "allOf": [{ "$ref": "#/$defs/chatIdField" }]
+    },
+    "error": {
+      "description": "Failure after the stream started. The stream ends after this event. `error` is shown to the visitor.",
+      "type": "object",
+      "required": ["type", "error"],
+      "properties": {
+        "type": { "const": "error" },
+        "error": { "type": "string" },
+        "statusCode": { "type": "integer" }
+      }
+    }
+  }
+}

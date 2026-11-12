@@ -92,16 +92,23 @@ describe('ChatInput', () => {
     expect(wrapper.emitted('send')).toBeTruthy()
   })
 
-  it('disables input when loading', () => {
+  it('keeps the text box usable while a reply loads, with a stop button instead of send', async () => {
     const wrapper = mount(ChatInput, {
       props: {
         ...defaultProps,
+        modelValue: 'next question',
         loading: true,
       },
     })
 
-    const textarea = wrapper.find('textarea')
-    expect(textarea.attributes('disabled')).toBeDefined()
+    // Disabling a focused text box would drop keyboard focus to the page.
+    expect(wrapper.find('textarea').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[aria-label="Send message"]').exists()).toBe(false)
+    const stop = wrapper.find('.consumer-input__stop')
+    expect(stop.attributes('aria-label')).toBe('Stop reply')
+    await stop.trigger('click')
+    expect(wrapper.emitted('stop')).toHaveLength(1)
+    expect(wrapper.emitted('send')).toBeUndefined()
   })
 
   it('disables input when disabled prop is true', () => {

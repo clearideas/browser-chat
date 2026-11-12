@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import { mockInitResponseNewChat } from '../fixtures/api-responses'
+import { expectConsole } from '../helpers/console-guard'
 import {
   resetAllMocks,
+  setupErrorResponse,
   setupExistingChatSession,
   setupForbiddenError,
   setupInitNewChat,
@@ -14,7 +16,7 @@ import {
   setupUnauthorizedError,
   setupVoiceChatStream,
 } from '../helpers/msw-utils'
-import { createWidgetWrapper, waitForStreamComplete } from '../helpers/test-utils'
+import { createWidgetWrapper, waitForStreamComplete, widgetStorageKey } from '../helpers/test-utils'
 
 describe('API Integration', () => {
   beforeEach(() => {
@@ -48,7 +50,7 @@ describe('API Integration', () => {
       await new Promise(resolve => setTimeout(resolve, 100))
 
       expect(global.localStorage.setItem).toHaveBeenCalledWith(
-        'clearideasPublicChatSessionId',
+        widgetStorageKey('session'),
         sessionId,
       )
 
@@ -72,6 +74,7 @@ describe('API Integration', () => {
     })
 
     it('handles 403 Forbidden error', async () => {
+      expectConsole('warn', /Init request failed: 403/)
       setupForbiddenError()
 
       const wrapper = createWidgetWrapper()
@@ -84,6 +87,7 @@ describe('API Integration', () => {
     })
 
     it('handles 401 Unauthorized error', async () => {
+      expectConsole('warn', /Init request failed: 401/)
       setupUnauthorizedError()
 
       const wrapper = createWidgetWrapper()
@@ -166,6 +170,10 @@ describe('API Integration', () => {
     })
 
     it('handles network errors gracefully', async () => {
+      expectConsole('error', /Failed to load init data: \[?TypeError/)
+      expectConsole('warn', /Cannot open widget: initialization failed/)
+      expectConsole('error', /Request failed: \[?TypeError/)
+      expectConsole('warn', /Network error\. If the server is reachable, check that its CORS/)
       setupInitTwice(mockInitResponseNewChat)
       setupNetworkError('Network error')
 
@@ -182,10 +190,16 @@ describe('API Integration', () => {
       await nextTick()
       await new Promise(resolve => setTimeout(resolve, 1000))
 
-      expect(vm.error).toBeTruthy()
+      // Network failures show one friendly message whatever the browser's error text.
+      expect(vm.error).toBe(
+        "Couldn't reach the chat service. Please check your connection and try again.",
+      )
     })
 
     it('handles 429 Rate Limit error', async () => {
+      expectConsole('warn', /Init request failed: 429/)
+      expectConsole('warn', /Cannot open widget: initialization failed/)
+      expectConsole('error', /Request failed: ServerMessageError: Rate limit exceeded/)
       setupInitTwice(mockInitResponseNewChat)
       setupRateLimitError()
 
@@ -202,7 +216,26 @@ describe('API Integration', () => {
       await nextTick()
       await new Promise(resolve => setTimeout(resolve, 1000))
 
-      expect(vm.error).toBeTruthy()
+      // The server's message is shown as sent (servers may localize it).
+      expect(vm.error).toBe('Rate limit exceeded')
+    })
+
+    it('shows a localized message, not HTTP details, when the error body has no message', async () => {
+      expectConsole('warn', /Init request failed: 502/)
+      expectConsole('warn', /Cannot open widget: initialization failed/)
+      expectConsole('error', /Request failed: Error: HTTP 502/)
+      setupInitTwice(mockInitResponseNewChat)
+      setupErrorResponse(502, {})
+
+      const wrapper = createWidgetWrapper({ openOnLoad: true, locale: 'fr' })
+      await nextTick()
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      const vm = wrapper.vm as any
+      await vm.sendPublicChatMessage('Test')
+      await nextTick()
+
+      expect(vm.error).toBe("Échec de l'envoi du message. Vérifiez votre connexion et réessayez.")
     })
   })
 
@@ -296,7 +329,7 @@ describe('API Integration', () => {
 
       // Verify session ID was stored from init response
       expect(global.localStorage.setItem).toHaveBeenCalledWith(
-        'clearideasPublicChatSessionId',
+        widgetStorageKey('session'),
         sessionId,
       )
 

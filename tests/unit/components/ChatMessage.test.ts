@@ -177,17 +177,41 @@ describe('ChatMessage', () => {
     expect(audioButton.exists()).toBe(true)
   })
 
-  it('renders source links with data-original-url', () => {
+  it('renders source citations as links to the original URL', () => {
     const wrapper = mount(ChatMessage, {
       props: {
         ...defaultProps,
-        message: mockChatMessages[3], // message with source links
+        message: mockChatMessages[3], // message with a data-original-url citation
+      },
+    })
+
+    const citation = wrapper.find('.ci-widget-message__text a.chat-source')
+    expect(citation.exists()).toBe(true)
+    expect(citation.attributes('href')).toBe('https://example.com/')
+    expect(citation.attributes('target')).toBe('_blank')
+    expect(citation.attributes('rel')).toBe('noopener noreferrer')
+    expect(citation.attributes('data-tooltip')).toBe('example.com')
+    expect(citation.text()).toBe('link')
+  })
+
+  it('renders visitor messages as plain text, not Markdown or HTML', () => {
+    const wrapper = mount(ChatMessage, {
+      props: {
+        ...defaultProps,
+        message: { role: 'user', content: '**bold** <img src=x onerror="alert(1)">\nline two' },
       },
     })
 
     const content = wrapper.find('.ci-widget-message__text')
-    const html = content.html()
-    expect(html).toContain('data-original-url')
-    expect(html).toContain('chat-source')
+    expect(content.find('strong').exists()).toBe(false)
+    expect(content.find('img').exists()).toBe(false)
+    expect(content.element.textContent).toBe('**bold** <img src=x onerror="alert(1)">\nline two')
+  })
+
+  it('shows the audio button label as a tooltip', () => {
+    const wrapper = mount(ChatMessage, {
+      props: { ...defaultProps, message: mockChatMessageWithAudio, isPlaying: false },
+    })
+    expect(wrapper.find('.ci-widget-audio-btn').attributes('data-tooltip')).toBe('Play audio')
   })
 })

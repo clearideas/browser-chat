@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Style isolation</title>
+    <script src="/tests/e2e/pages/dev-theme.js"></script>
+    <script src="/dev-config.js"></script>
+    <!-- Deliberately hostile page CSS: none of it may reach the widget. -->
+    <style data-page-style>
+      html {
+        font-size: 5px;
+      }
+      body {
+        font-family: 'Comic Sans MS', cursive;
+        color: rgb(255, 0, 255);
+        line-height: 5;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+      }
+      * {
+        box-sizing: border-box !important;
+      }
+      div,
+      p,
+      button,
+      textarea,
+      a {
+        border: 3px solid rgb(255, 0, 0) !important;
+        color: rgb(0, 255, 0) !important;
+        background: rgb(255, 255, 0) !important;
+      }
+      button {
+        display: none !important;
+      }
+      [class^='ci-widget'],
+      .ci-widget-fab,
+      .ci-widget-panel {
+        display: none !important;
+      }
+    </style>
+    <!-- The explanation avoids the elements styled above, so it stays readable. -->
+    <style data-page-style>
+      #about {
+        display: block;
+        max-width: 720px;
+        margin: 24px auto;
+        font:
+          16px/1.5 system-ui,
+          sans-serif;
+        color: #1f2937;
+        letter-spacing: normal;
+        text-transform: none;
+      }
+      #about h1 {
+        font-size: 24px;
+      }
+      #about section {
+        display: block;
+        margin: 12px 0;
+      }
+      html.dark {
+        background: #111827;
+      }
+      html.dark #about {
+        color: #e5e7eb;
+      }
+      html.dark #about .expect {
+        background: #052e26;
+        border-color: #047857;
+      }
+      #about .expect {
+        padding: 12px 16px;
+        border-radius: 8px;
+        background: #ecfdf5;
+        border: 1px solid #6ee7b7;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="about">
+      <h1>Style isolation</h1>
+      <section>
+        This page's CSS is hostile: a 5px root font size, Comic Sans in magenta, uppercase text, red
+        borders and yellow backgrounds on every <code>div</code>, <code>p</code>,
+        <code>button</code> and link, and rules that hide anything whose class starts with
+        <code>ci-widget</code>. It also contains two page elements that reuse the widget's class
+        names (hidden by those same rules; the tests check that the widget's CSS leaves them alone).
+      </section>
+      <section class="expect">
+        <strong>Expected:</strong> the widget in the corner looks exactly as on the demo page: none
+        of the page's CSS reaches it, because it renders in a shadow root, and its wrapper elements
+        take no space in the page (no red border line). The widget's own CSS does not style the page
+        either.
+      </section>
+    </header>
+    <!-- Page elements that reuse widget class names: widget CSS must not style them. -->
+    <div class="ci-widget-message--error" id="page-error">page element with a widget class</div>
+    <p class="ci-widget-powered" id="page-powered">another page element</p>
+    <script src="/dist/clearideas-widget.iife.js"></script>
+    <script src="/tests/e2e/pages/init-demo.js"></script>
+  </body>
+</html>

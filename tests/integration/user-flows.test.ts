@@ -11,7 +11,7 @@ import {
   setupTextChatStream,
   setupVoiceChatStream,
 } from '../helpers/msw-utils'
-import { createWidgetWrapper, waitForStreamComplete } from '../helpers/test-utils'
+import { createWidgetWrapper, waitForStreamComplete, widgetStorageKey } from '../helpers/test-utils'
 
 describe('User Flows', () => {
   beforeEach(() => {
@@ -336,7 +336,7 @@ describe('User Flows', () => {
       const vm = wrapper.vm as any
 
       // Verify session ID from localStorage was used initially
-      expect(global.localStorage.getItem).toHaveBeenCalledWith('clearideasPublicChatSessionId')
+      expect(global.localStorage.getItem).toHaveBeenCalledWith(widgetStorageKey('session'))
 
       // Open the widget to trigger activation with the refreshed session ID
       setupInitNewChat(newSessionId)
@@ -347,7 +347,7 @@ describe('User Flows', () => {
       // Verify new session ID from init response was stored
       expect(vm.sessionId).toBe(newSessionId)
       expect(global.localStorage.setItem).toHaveBeenCalledWith(
-        'clearideasPublicChatSessionId',
+        widgetStorageKey('session'),
         newSessionId,
       )
 

@@ -155,7 +155,9 @@ export const handlers = [
   http.get('https://api.clearideas.local/public/chat/init', async () => {
     // Check for network error
     if (currentNetworkError) {
-      throw currentNetworkError
+      // A network-level failure: fetch rejects with a TypeError, as when the server is
+      // unreachable or CORS blocks the response. (Throwing here would make MSW answer 500.)
+      return HttpResponse.error()
     }
 
     // Check for error response
@@ -183,7 +185,9 @@ export const handlers = [
   // POST /public/chat/session
   http.post('https://api.clearideas.local/public/chat/session', async () => {
     if (currentNetworkError) {
-      throw currentNetworkError
+      // A network-level failure: fetch rejects with a TypeError, as when the server is
+      // unreachable or CORS blocks the response. (Throwing here would make MSW answer 500.)
+      return HttpResponse.error()
     }
 
     if (currentActivationDelayMs > 0) {
@@ -214,7 +218,9 @@ export const handlers = [
   http.post('https://api.clearideas.local/public/chat/stream', async () => {
     // Check for network error
     if (currentNetworkError) {
-      throw currentNetworkError
+      // A network-level failure: fetch rejects with a TypeError, as when the server is
+      // unreachable or CORS blocks the response. (Throwing here would make MSW answer 500.)
+      return HttpResponse.error()
     }
 
     // Check for error response
@@ -233,7 +239,9 @@ export const handlers = [
   http.post('https://api.clearideas.local/public/chat/:chatId/stream', async () => {
     // Check for network error
     if (currentNetworkError) {
-      throw currentNetworkError
+      // A network-level failure: fetch rejects with a TypeError, as when the server is
+      // unreachable or CORS blocks the response. (Throwing here would make MSW answer 500.)
+      return HttpResponse.error()
     }
 
     // Check for error response
@@ -252,7 +260,9 @@ export const handlers = [
   http.post('https://api.clearideas.local/public/chat/voice/stream', async () => {
     // Check for network error
     if (currentNetworkError) {
-      throw currentNetworkError
+      // A network-level failure: fetch rejects with a TypeError, as when the server is
+      // unreachable or CORS blocks the response. (Throwing here would make MSW answer 500.)
+      return HttpResponse.error()
     }
 
     // Check for error response
@@ -271,7 +281,9 @@ export const handlers = [
   http.post('https://api.clearideas.local/public/chat/voice/:chatId/stream', async () => {
     // Check for network error
     if (currentNetworkError) {
-      throw currentNetworkError
+      // A network-level failure: fetch rejects with a TypeError, as when the server is
+      // unreachable or CORS blocks the response. (Throwing here would make MSW answer 500.)
+      return HttpResponse.error()
     }
 
     // Check for error response

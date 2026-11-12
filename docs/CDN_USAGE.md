@@ -2,6 +2,16 @@
 
 This guide shows how to integrate the Clear Ideas Chat Widget via updates.
 
+> **No stylesheet needed:** the widget script carries its own styles and renders in a shadow root,
+> so the `<link rel="stylesheet">` tags in the examples below are unnecessary (and have no effect on
+> the widget). See "Styling and isolation" in the README for theming with CSS variables.
+>
+> **Dynamic pages:** elements with `data-clearideas-widget` added after the page loads are
+> initialized automatically, and a widget is destroyed when its element is removed.
+>
+> **Debugging:** set `window.__ClearIdeasWidgetDebug = true` in the browser console for detailed
+> logs. Warnings and errors are always logged.
+
 ## updates URLs
 
 ### Latest Version (Recommended)
@@ -360,6 +370,7 @@ The server uses this header to determine whether to set cookies. Cookies are onl
 | `data-has-consent` | boolean/string | `true` | Consent check: `true`, `false`, or global variable name |
 | `data-consent-required` | boolean | `false` | If `true`, consent is required before using cookies/localStorage. When `true` and `consentGranted` is `false`, widget uses sessionStorage only. |
 | `data-consent-granted` | boolean | `false` | If `true`, consent has been granted. Only relevant when `consentRequired` is `true`. When changed from `false` to `true`, widget migrates from sessionStorage to localStorage. |
+| `data-shadow-dom` | boolean | `true` | Render in a shadow root, isolated from page styles. `false` renders in the page DOM so page CSS can restyle the widget. |
 
 **Note:** `placeholder` and `voiceEnabled` are controlled by server init settings and cannot be set via client config.
 

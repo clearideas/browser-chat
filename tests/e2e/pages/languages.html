@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Languages</title>
+    <link rel="stylesheet" href="/tests/e2e/pages/page.css" />
+    <script src="/tests/e2e/pages/dev-theme.js"></script>
+    <script src="/dev-config.js"></script>
+    <script>
+      // ?lang= sets the page language before the widget loads; ?lang=none removes it.
+      const initialLang = new URLSearchParams(location.search).get('lang')
+      if (initialLang === 'none') document.documentElement.removeAttribute('lang')
+      else if (initialLang) document.documentElement.lang = initialLang
+    </script>
+  </head>
+  <body>
+    <p><a href="/">← All development pages</a></p>
+    <h1>Languages</h1>
+    <p>
+      The widget is initialized here without a <code>locale</code> option, so it follows the page's
+      <code>&lt;html lang&gt;</code>, and the browser's languages when the page has none. Regional
+      tags use their language (<code>fr-CA</code> → French, <code>pt-BR</code> → Portuguese),
+      Chinese is matched by script (<code>zh-TW</code> → Traditional), and languages without a
+      translation fall back to English. The test server answers in the same language.
+    </p>
+    <p class="expect">
+      <strong>Expected:</strong> changing the page language below changes the launcher label and the
+      open chat at once, including the server's greeting. Arabic lays the panel out right to left.
+      “Add Swedish strings” supplies a custom translation with <code>setMessages()</code>, so
+      <code>sv</code> is no longer English.
+    </p>
+
+    <p class="controls">
+      <label for="lang">Page language</label>
+      <select id="lang"></select>
+      <button id="add-swedish" type="button">Add Swedish strings</button>
+      <button id="open" type="button">Open chat</button>
+    </p>
+    <p>
+      Page <code>lang</code>: <span id="page-lang" class="status"></span> · Widget language:
+      <span id="widget-lang" class="status"></span> · Direction:
+      <span id="widget-dir" class="status"></span> · Launcher label:
+      <span id="launcher-label" class="status"></span>
+    </p>
+
+    <script src="/dist/clearideas-widget.iife.js"></script>
+    <script>
+      const EXAMPLES = ['fr-CA', 'pt-BR', 'zh-TW', 'zh-CN', 'es-MX', 'sv', 'none']
+      const select = document.getElementById('lang')
+      for (const tag of [...window.ClearIdeasWidget.BUILT_IN_LOCALES, ...EXAMPLES]) {
+        const label =
+          tag === 'none'
+            ? 'No lang attribute (browser languages)'
+            : `${new Intl.DisplayNames(['en'], { type: 'language' }).of(tag)} (${tag})`
+        select.add(new Option(label, tag))
+      }
+      select.value = document.documentElement.getAttribute('lang') ?? 'none'
+      select.addEventListener('change', () => {
+        if (select.value === 'none') document.documentElement.removeAttribute('lang')
+        else document.documentElement.lang = select.value
+      })
+
+      window.testWidget = window.ClearIdeasWidget.init({
+        accessKey: 'demo-public-key',
+        apiBaseUrl: window.CHAT_DEV_API_URL,
+      })
+
+      document.getElementById('add-swedish').addEventListener('click', () => {
+        window.testWidget.setMessages({
+          sv: {
+            fab: { openChat: 'Öppna chatten', closeChat: 'Stäng chatten' },
+            input: { placeholder: 'Ställ en fråga...', sendMessage: 'Skicka meddelande' },
+          },
+        })
+      })
+      document.getElementById('open').addEventListener('click', () => window.testWidget.open())
+
+      // Shows what the widget chose, read from its elements (in its shadow root).
+      function update() {
+        const shadow = document.querySelector('[data-clearideas-widget-host]')?.shadowRoot
+        const root = shadow?.querySelector('.ci-widget')
+        document.getElementById('page-lang').textContent =
+          document.documentElement.getAttribute('lang') ?? '(none)'
+        document.getElementById('widget-lang').textContent = root?.lang ?? '…'
+        document.getElementById('widget-dir').textContent = root?.dir ?? '…'
+        document.getElementById('launcher-label').textContent =
+          shadow?.querySelector('.ci-widget-fab')?.getAttribute('aria-label') ?? '…'
+      }
+      setInterval(update, 250)
+      update()
+    </script>
+  </body>
+</html>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useWidgetI18n } from '../i18n/runtime'
-import { icons } from '../icons'
+import { getIconSVG } from '../icons'
 import type { InitResponse } from '../types'
 
 const props = defineProps<{
@@ -14,29 +14,12 @@ const props = defineProps<{
   displayName: string
 }>()
 
-// Destructure props for CSS v-bind usage
-const { widgetColorLight, widgetColorDark, widgetColorBase } = props
 const { t } = useWidgetI18n()
 
 const emit = defineEmits<{
   'go-home': []
   close: []
-  'back-btn-ref': [element: HTMLElement | null]
-  'close-btn-ref': [element: HTMLElement | null]
 }>()
-
-// Helper function to wrap icon path in SVG tag
-function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
-  const iconPath = icons[iconName]
-  if (!iconPath) return ''
-  let viewBox = '0 0 640 640' // default
-  if (iconName === 'ciIcon') {
-    viewBox = '0 0 512 512'
-  } else if (iconName === 'chevronRight' || iconName === 'chevronLeft') {
-    viewBox = '0 0 640 640'
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${size}" height="${size}" fill="currentColor">${iconPath}</svg>`
-}
 </script>
 
 <template>
@@ -80,11 +63,15 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
         <div class="ci-widget-hero__text">
           <div class="ci-widget-hero__greeting">
             <span class="ci-widget-hero__greeting-text">
-              {{ t('header.greeting', { name: props.displayName }) }}
+              {{
+                props.displayName
+                  ? t('header.greeting', { name: props.displayName })
+                  : t('header.greetingAnonymous')
+              }}
             </span>
           </div>
           <div class="ci-widget-hero__headline">
-            <span class="ci-widget-hero__headline-gradient">
+            <span class="ci-widget-hero__headline-gradient" dir="auto">
               {{ props.initData?.heroGreeting || t('header.heroGreetingDefault') }}
             </span>
           </div>
@@ -106,26 +93,28 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
         :style="{ color: props.headerContrastColor }"
         v-html="getIconSVG('ciIcon', 24)"
       ></span>
-      <span class="ci-widget-title-text">{{ props.widgetChatName }}</span>
+      <span class="ci-widget-title-text" dir="auto">{{ props.widgetChatName }}</span>
     </div>
     <div class="ci-widget-header-actions">
       <button
         v-if="props.currentView === 'chat'"
-        :ref="el => emit('back-btn-ref', el as HTMLElement | null)"
         class="ci-widget-btn-icon"
+        :data-tooltip="t('header.backToHome')"
+        data-tooltip-placement="left"
         :style="{ color: props.headerContrastColor }"
         @click="emit('go-home')"
         :aria-label="t('header.backToHome')"
       >
         <span
-          class="ci-widget-icon"
+          class="ci-widget-icon ci-widget-icon--mirror"
           :style="{ color: props.headerContrastColor }"
           v-html="getIconSVG('chevronLeft', 18)"
         ></span>
       </button>
       <button
-        :ref="el => emit('close-btn-ref', el as HTMLElement | null)"
         class="ci-widget-btn-icon"
+        :data-tooltip="t('fab.closeChat')"
+        data-tooltip-placement="left"
         :style="{ color: props.headerContrastColor }"
         @click="emit('close')"
         :aria-label="t('header.close')"
@@ -160,7 +149,7 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
 .ci-widget-panel__header--hero {
   padding: 20px 16px 16px 16px;
   min-height: auto;
-  color: #fff;
+  color: var(--ci-widget-on-accent);
   background: transparent !important;
   border-bottom: none !important;
 }
@@ -179,7 +168,7 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
   left: 0;
   right: 0;
   bottom: 0;
-  background: v-bind(widgetColorBase);
+  background: var(--ci-widget-accent);
   opacity: 0.85;
   pointer-events: none;
   z-index: 0;
@@ -197,17 +186,21 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
 }
 
 .ci-widget-hero-background__layer--1 {
-  background: radial-gradient(circle at 30% 40%, v-bind(widgetColorLight) 0%, transparent 50%);
+  background: radial-gradient(circle at 30% 40%, var(--ci-widget-accent-soft) 0%, transparent 50%);
   animation: heroFlow1 12s ease-in-out infinite;
 }
 
 .ci-widget-hero-background__layer--2 {
-  background: radial-gradient(circle at 70% 60%, v-bind(widgetColorDark) 0%, transparent 50%);
+  background: radial-gradient(
+    circle at 70% 60%,
+    var(--ci-widget-accent-strong) 0%,
+    transparent 50%
+  );
   animation: heroFlow2 15s ease-in-out infinite;
 }
 
 .ci-widget-hero-background__layer--3 {
-  background: radial-gradient(circle at 50% 50%, v-bind(widgetColorBase) 0%, transparent 60%);
+  background: radial-gradient(circle at 50% 50%, var(--ci-widget-accent) 0%, transparent 60%);
   animation: heroFlow3 18s ease-in-out infinite;
   opacity: 0.3;
 }
@@ -270,6 +263,8 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
   align-items: center;
   gap: 16px;
   flex: 1;
+  /* Let long server-supplied text wrap instead of pushing the close button out of view. */
+  min-width: 0;
 }
 
 .ci-widget-hero__logo-wrapper {
@@ -286,7 +281,7 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
   z-index: 1;
   width: 32px;
   height: 32px;
-  color: white;
+  color: var(--ci-widget-on-accent);
   filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.3));
 }
 
@@ -300,6 +295,8 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .ci-widget-hero__greeting {
@@ -308,7 +305,8 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
   gap: 8px;
   font-weight: 600;
   font-size: 15px;
-  color: rgba(255, 255, 255, 0.9);
+  color: inherit;
+  opacity: 0.9;
 }
 
 .ci-widget-hero__greeting-text {
@@ -325,14 +323,12 @@ function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
 .ci-widget-hero__headline-gradient {
   background: linear-gradient(
     135deg,
-    #ffffff 0%,
-    rgba(255, 255, 255, 0.95) 50%,
-    rgba(255, 255, 255, 0.85) 100%
+    var(--ci-widget-on-accent) 0%,
+    color-mix(in srgb, var(--ci-widget-on-accent) 85%, transparent) 100%
   );
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
-  text-shadow: 0 0 20px rgba(255, 255, 255, 0.3);
   position: relative;
   display: inline-block;
 }

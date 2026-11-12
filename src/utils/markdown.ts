@@ -1,471 +1,855 @@
-import DOMPurify from 'dompurify'
-// Use core highlight.js instead of full build to reduce bundle size
-import hljs from 'highlight.js/lib/core'
-import bash from 'highlight.js/lib/languages/bash'
-import css from 'highlight.js/lib/languages/css'
-// Register only commonly used languages to keep bundle small
-import javascript from 'highlight.js/lib/languages/javascript'
-import json from 'highlight.js/lib/languages/json'
-import python from 'highlight.js/lib/languages/python'
-import typescript from 'highlight.js/lib/languages/typescript'
-import html from 'highlight.js/lib/languages/xml'
-import MarkdownIt from 'markdown-it'
+// Markdown parser for chat messages. Produces a small syntax tree of plain objects; the widget
+// renders it with Vue render functions (components/MarkdownContent.ts), so message content is
+// never parsed as HTML.
+//
+// Supported (a practical subset of CommonMark and GitHub Flavored Markdown):
+//   blocks:  paragraphs, ATX and setext headings, fenced code, blockquotes, ordered and unordered
+//            lists (nested, tight or loose), tables, thematic breaks
+//   inline:  emphasis and strong emphasis, strikethrough, code spans, links, images (rendered as
+//            links, never loaded), autolinks, backslash escapes, entities, hard line breaks
+// Protocol extensions (docs/protocol/README.md §7):
+//   [label](url){data-original-url="..."}   source citation
+//   <WebSource data-url="...">Title</WebSource>   web search citation
+//   <chunkId>...</chunkId>   removed
+//   <br>   line break (common in model-written tables)
+// Not supported: raw HTML (shown as text), indented code blocks, reference-style links,
+// footnotes, task list checkboxes, bare-URL autolinking, typographic replacements.
 
-// Register languages
-hljs.registerLanguage('javascript', javascript)
-hljs.registerLanguage('js', javascript)
-hljs.registerLanguage('typescript', typescript)
-hljs.registerLanguage('ts', typescript)
-hljs.registerLanguage('json', json)
-hljs.registerLanguage('css', css)
-hljs.registerLanguage('html', html)
-hljs.registerLanguage('xml', html)
-hljs.registerLanguage('bash', bash)
-hljs.registerLanguage('sh', bash)
-hljs.registerLanguage('python', python)
-hljs.registerLanguage('py', python)
+export type Inline =
+  | { type: 'text'; text: string }
+  | { type: 'code'; text: string }
+  | { type: 'strong' | 'em' | 'del'; children: Inline[] }
+  | { type: 'link'; destination: string; attributes: Record<string, string>; children: Inline[] }
+  | { type: 'image'; destination: string; alt: string }
+  | { type: 'break' }
+  | { type: 'softbreak' }
 
-// Initialize markdown renderer
-const md = MarkdownIt({
-  html: true,
-  linkify: false,
-  typographer: true,
-  highlight: function (str: string, lang: string): string {
-    if (lang && hljs.getLanguage(lang)) {
-      try {
-        return `<pre class="hljs"><code>${
-          hljs.highlight(str, { language: lang, ignoreIllegals: true }).value
-        }</code></pre>`
-      } catch {}
+export type Align = 'left' | 'center' | 'right' | null
+
+export type Block =
+  | { type: 'paragraph'; children: Inline[] }
+  | { type: 'heading'; level: 1 | 2 | 3 | 4 | 5 | 6; children: Inline[] }
+  | { type: 'code'; language: string; text: string }
+  | { type: 'blockquote'; children: Block[] }
+  | { type: 'list'; ordered: boolean; start: number; tight: boolean; items: Block[][] }
+  | { type: 'table'; align: Align[]; header: Inline[][]; rows: Inline[][][] }
+  | { type: 'hr' }
+
+const MAX_DEPTH = 20
+/** Bounds on scanning, so unmatched `[`, backticks or `*` cannot make parsing quadratic. */
+const MAX_LINK_LABEL = 2000
+const MAX_CODE_SPAN = 4000
+const MAX_OPENER_SEARCH = 200
+
+export function parseMarkdown(source: string | null | undefined): Block[] {
+  if (!source) return []
+  const text = preprocess(source)
+  const lines = text.split('\n').map(expandLeadingTabs)
+  return parseBlocks(lines, 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preprocessing
+// ---------------------------------------------------------------------------------------------
+
+function preprocess(source: string): string {
+  return (
+    source
+      .replace(/\r\n?/g, '\n')
+      // Internal retrieval markers and their contents are never shown.
+      .replace(/<chunkid[^>]*>[\s\S]*?<\/chunkid>/gi, '')
+      .replace(/<chunkid[^>]*\/\s*>/gi, '')
+      // Some servers send WebSource tags HTML-escaped; restore them so the inline parser sees them.
+      .replace(
+        /&lt;(\/?websource\b[\s\S]*?)&gt;/gi,
+        (_match, inner: string) =>
+          `<${inner.replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")}>`,
+      )
+  )
+}
+
+function expandLeadingTabs(line: string): string {
+  const match = /^[ \t]+/.exec(line)
+  if (!match || !match[0].includes('\t')) return line
+  let width = 0
+  for (const char of match[0]) width = char === '\t' ? width + 4 - (width % 4) : width + 1
+  return ' '.repeat(width) + line.slice(match[0].length)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Blocks
+// ---------------------------------------------------------------------------------------------
+
+const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/
+const ATX_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/
+const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/
+const SETEXT_UNDERLINE = /^ {0,3}(=+|-+)[ \t]*$/
+const BLOCKQUOTE = /^ {0,3}> ?/
+const LIST_ITEM = /^( {0,3})([-*+]|(\d{1,9})([.)]))(?:( {1,4})(.*)|[ \t]*)$/
+const TABLE_DELIMITER = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/
+
+const isBlank = (line: string) => line.trim() === ''
+
+interface ListMarker {
+  indent: number
+  bullet: string | null // '-', '*' or '+' for bullet lists
+  delimiter: string | null // '.' or ')' for ordered lists
+  start: number
+  contentIndent: number
+  content: string
+}
+
+function matchListItem(line: string): ListMarker | null {
+  const match = LIST_ITEM.exec(line)
+  if (!match) return null
+  const indent = match[1].length
+  const marker = match[2]
+  const ordered = match[3] !== undefined
+  let content: string
+  let contentIndent: number
+  if (match[5] !== undefined) {
+    content = match[6]
+    contentIndent = indent + marker.length + match[5].length
+  } else {
+    content = ''
+    contentIndent = indent + marker.length + 1
+  }
+  return {
+    indent,
+    bullet: ordered ? null : marker,
+    delimiter: ordered ? match[4] : null,
+    start: ordered ? Number(match[3]) : 1,
+    contentIndent,
+    content,
+  }
+}
+
+function startsBlock(line: string, interruptsParagraph: boolean): boolean {
+  if (FENCE.test(line) || ATX_HEADING.test(line) || THEMATIC_BREAK.test(line)) return true
+  if (BLOCKQUOTE.test(line)) return true
+  const item = matchListItem(line)
+  if (!item) return false
+  // An ordered list may interrupt a paragraph only when it starts at 1, and an empty item never
+  // does (CommonMark), which keeps "2019. A year" style lines inside paragraphs.
+  if (interruptsParagraph && (!item.content.trim() || (item.bullet === null && item.start !== 1))) {
+    return false
+  }
+  return true
+}
+
+function splitTableRow(line: string): string[] {
+  let row = line.trim()
+  if (row.startsWith('|')) row = row.slice(1)
+  if (row.endsWith('|') && !row.endsWith('\\|')) row = row.slice(0, -1)
+  const cells: string[] = []
+  let current = ''
+  for (let index = 0; index < row.length; index += 1) {
+    const char = row[index]
+    if (char === '\\' && row[index + 1] === '|') {
+      current += '|'
+      index += 1
+    } else if (char === '|') {
+      cells.push(current.trim())
+      current = ''
+    } else {
+      current += char
     }
-    // Fallback: escape HTML if language not supported
-    return `<pre class="hljs"><code>${md.utils.escapeHtml(str)}</code></pre>`
-  },
-})
+  }
+  cells.push(current.trim())
+  return cells
+}
 
-// Note: We don't use markdown-it-attrs anymore - we handle attributes in post-processing
-// This is more reliable since markdown-it-attrs was spotty with link attributes
+function parseAlign(cell: string): Align {
+  const left = cell.startsWith(':')
+  const right = cell.endsWith(':')
+  if (left && right) return 'center'
+  if (right) return 'right'
+  if (left) return 'left'
+  return null
+}
 
-/**
- * Extracts all data-* attributes from an HTML attributes string
- */
-function extractDataAttributes(attrsString: string): Record<string, string> {
-  const result: Record<string, string> = {}
-  const dataAttrRegex = /data-([a-zA-Z0-9\-]+)=["']([^"']*)["']/g
-  let match
+function parseBlocks(lines: string[], depth: number): Block[] {
+  const blocks: Block[] = []
+  let index = 0
 
-  while ((match = dataAttrRegex.exec(attrsString)) !== null) {
-    const attrName = 'data-' + match[1]
-    const attrValue = match[2]
-    result[attrName] = attrValue
+  while (index < lines.length) {
+    const line = lines[index]
+    if (isBlank(line)) {
+      index += 1
+      continue
+    }
+
+    // Fenced code
+    const fence = FENCE.exec(line)
+    if (fence && !(fence[1][0] === '`' && fence[2].includes('`'))) {
+      const marker = fence[1]
+      const fenceIndent = line.length - line.trimStart().length
+      const closing = new RegExp(
+        `^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`,
+      )
+      const body: string[] = []
+      index += 1
+      while (index < lines.length && !closing.test(lines[index])) {
+        body.push(lines[index].replace(new RegExp(`^ {0,${fenceIndent}}`), ''))
+        index += 1
+      }
+      index += 1 // closing fence (or end of input)
+      blocks.push({
+        type: 'code',
+        language: fence[2].trim().split(/\s+/)[0] ?? '',
+        text: body.join('\n'),
+      })
+      continue
+    }
+
+    const heading = ATX_HEADING.exec(line)
+    if (heading) {
+      blocks.push({
+        type: 'heading',
+        level: heading[1].length as 1 | 2 | 3 | 4 | 5 | 6,
+        children: parseInline(heading[2] ?? ''),
+      })
+      index += 1
+      continue
+    }
+
+    if (THEMATIC_BREAK.test(line)) {
+      blocks.push({ type: 'hr' })
+      index += 1
+      continue
+    }
+
+    if (BLOCKQUOTE.test(line)) {
+      const inner: string[] = []
+      while (index < lines.length && !isBlank(lines[index])) {
+        const current = lines[index]
+        if (BLOCKQUOTE.test(current)) inner.push(current.replace(BLOCKQUOTE, ''))
+        else if (inner.length > 0 && !startsBlock(current, true))
+          inner.push(current) // lazy line
+        else break
+        index += 1
+      }
+      blocks.push({
+        type: 'blockquote',
+        children: depth < MAX_DEPTH ? parseBlocks(inner, depth + 1) : [textParagraph(inner)],
+      })
+      continue
+    }
+
+    const item = matchListItem(line)
+    if (item) {
+      const result = parseList(lines, index, item, depth)
+      blocks.push(result.block)
+      index = result.next
+      continue
+    }
+
+    // Table: a header row followed by a delimiter row with the same number of cells.
+    if (line.includes('|') && index + 1 < lines.length && TABLE_DELIMITER.test(lines[index + 1])) {
+      const header = splitTableRow(line)
+      const delimiters = splitTableRow(lines[index + 1])
+      if (header.length === delimiters.length) {
+        index += 2
+        const rows: Inline[][][] = []
+        while (index < lines.length && !isBlank(lines[index]) && lines[index].includes('|')) {
+          const cells = splitTableRow(lines[index])
+          rows.push(header.map((_cell, column) => parseInline(cells[column] ?? '')))
+          index += 1
+        }
+        blocks.push({
+          type: 'table',
+          align: delimiters.map(parseAlign),
+          header: header.map(cell => parseInline(cell)),
+          rows,
+        })
+        continue
+      }
+    }
+
+    // Paragraph, possibly turned into a setext heading by an underline.
+    const paragraph: string[] = [line.trimStart()]
+    index += 1
+    let setextLevel: 1 | 2 | null = null
+    while (index < lines.length && !isBlank(lines[index])) {
+      const current = lines[index]
+      const underline = SETEXT_UNDERLINE.exec(current)
+      if (underline) {
+        setextLevel = underline[1][0] === '=' ? 1 : 2
+        index += 1
+        break
+      }
+      if (startsBlock(current, true)) break
+      paragraph.push(current.trimStart())
+      index += 1
+    }
+    const children = parseInline(paragraph.join('\n').trimEnd())
+    blocks.push(
+      setextLevel
+        ? { type: 'heading', level: setextLevel, children }
+        : { type: 'paragraph', children },
+    )
   }
 
+  return blocks
+}
+
+function textParagraph(lines: string[]): Block {
+  return { type: 'paragraph', children: [{ type: 'text', text: lines.join('\n') }] }
+}
+
+function parseList(
+  lines: string[],
+  startIndex: number,
+  first: ListMarker,
+  depth: number,
+): { block: Block; next: number } {
+  const ordered = first.bullet === null
+  const items: Block[][] = []
+  let tight = true
+  let index = startIndex
+  let marker: ListMarker | null = first
+
+  while (marker) {
+    const itemLines: string[] = [marker.content]
+    const contentIndent = marker.contentIndent
+    index += 1
+    let endsWithBlank = false
+
+    while (index < lines.length) {
+      const line = lines[index]
+      if (isBlank(line)) {
+        endsWithBlank = true
+        itemLines.push('')
+        index += 1
+        continue
+      }
+      const indent = line.length - line.trimStart().length
+      if (indent >= contentIndent) {
+        itemLines.push(line.slice(contentIndent))
+        endsWithBlank = false
+        index += 1
+        continue
+      }
+      if (endsWithBlank) break // a blank line followed by a less-indented line ends the item
+      // Lazy continuation of a paragraph inside the item.
+      const previous = itemLines[itemLines.length - 1]
+      if (previous.trim() && !startsBlock(line, true) && !matchListItem(line)) {
+        itemLines.push(line.trim())
+        index += 1
+        continue
+      }
+      break
+    }
+
+    // Trailing blank lines belong between items; a blank line inside an item makes the list loose.
+    while (itemLines.length > 1 && !itemLines[itemLines.length - 1].trim()) itemLines.pop()
+    if (itemLines.some(entry => !entry.trim())) tight = false
+
+    items.push(depth < MAX_DEPTH ? parseBlocks(itemLines, depth + 1) : [textParagraph(itemLines)])
+
+    // Continue with a sibling item of the same kind?
+    const next: ListMarker | null = index < lines.length ? matchListItem(lines[index]) : null
+    const sameKind =
+      next !== null &&
+      next.indent < contentIndent &&
+      (ordered ? next.delimiter === first.delimiter : next.bullet === first.bullet)
+    if (!sameKind || THEMATIC_BREAK.test(lines[index])) break
+    if (endsWithBlank) tight = false
+    marker = next
+  }
+
+  return { block: { type: 'list', ordered, start: first.start, tight, items }, next: index }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Inline
+// ---------------------------------------------------------------------------------------------
+
+interface Delimiter {
+  type: 'delimiter'
+  char: '*' | '_' | '~'
+  count: number
+  canOpen: boolean
+  canClose: boolean
+}
+
+type Token = Inline | Delimiter
+
+const ASCII_PUNCTUATION = /[!-/:-@[-`{-~]/
+const isWhitespace = (char: string | undefined) => char === undefined || /\s/u.test(char)
+const isPunctuation = (char: string | undefined) =>
+  char !== undefined && (ASCII_PUNCTUATION.test(char) || /\p{P}/u.test(char))
+
+const ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: '\u00a0',
+}
+
+export function decodeEntities(text: string): string {
+  return text.replace(/&(#\d{1,7}|#x[0-9a-f]{1,6}|[a-z]+);/gi, (match, body: string) => {
+    if (body[0] === '#') {
+      const code =
+        body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : Number(body.slice(1))
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '\ufffd'
+    }
+    return ENTITIES[body.toLowerCase()] ?? match
+  })
+}
+
+export function parseInline(source: string, depth = 0): Inline[] {
+  const tokens: Token[] = []
+  let brackets: Map<number, number> | null = null // computed on first use
+  let text = ''
+  const flush = () => {
+    if (text) tokens.push({ type: 'text', text: decodeEntities(text) })
+    text = ''
+  }
+
+  let index = 0
+  while (index < source.length) {
+    const char = source[index]
+
+    // Backslash escape or hard break.
+    if (char === '\\') {
+      const next = source[index + 1]
+      if (next === '\n') {
+        flush()
+        tokens.push({ type: 'break' })
+        index += 2
+        continue
+      }
+      if (next !== undefined && ASCII_PUNCTUATION.test(next)) {
+        text += next
+        index += 2
+        continue
+      }
+    }
+
+    // Line endings: two trailing spaces make a hard break.
+    if (char === '\n') {
+      const hard = / {2,}$/.test(text)
+      text = text.replace(/ +$/, '')
+      flush()
+      tokens.push({ type: hard ? 'break' : 'softbreak' })
+      index += 1
+      while (source[index] === ' ') index += 1
+      continue
+    }
+
+    // Code span.
+    if (char === '`') {
+      const runSize = runLength(source, index, '`')
+      const closeAt = findClosingBackticks(source, index + runSize, runSize)
+      if (closeAt >= 0) {
+        flush()
+        let code = source.slice(index + runSize, closeAt).replace(/\n/g, ' ')
+        if (code.length > 2 && code.startsWith(' ') && code.endsWith(' ') && code.trim()) {
+          code = code.slice(1, -1)
+        }
+        tokens.push({ type: 'code', text: code })
+        index = closeAt + runSize
+        continue
+      }
+      text += '`'.repeat(runSize)
+      index += runSize
+      continue
+    }
+
+    if (char === '<') {
+      const rest = source.slice(index)
+      const autolink = /^<((?:https?:\/\/|mailto:)[^\s<>]*)>/i.exec(rest)
+      if (autolink) {
+        flush()
+        tokens.push({
+          type: 'link',
+          destination: autolink[1],
+          attributes: {},
+          children: [{ type: 'text', text: autolink[1].replace(/^mailto:/i, '') }],
+        })
+        index += autolink[0].length
+        continue
+      }
+      const lineBreak = /^<br\s*\/?>/i.exec(rest)
+      if (lineBreak) {
+        flush()
+        tokens.push({ type: 'break' })
+        index += lineBreak[0].length
+        continue
+      }
+      const webSource = parseWebSource(rest, depth)
+      if (webSource) {
+        flush()
+        if (webSource.node) tokens.push(webSource.node)
+        index += webSource.length
+        continue
+      }
+    }
+
+    // Links and images.
+    if (char === '[' || (char === '!' && source[index + 1] === '[')) {
+      const isImage = char === '!'
+      brackets ??= matchBrackets(source)
+      const link = parseLink(source, isImage ? index + 1 : index, brackets)
+      if (link) {
+        flush()
+        if (isImage) {
+          tokens.push({ type: 'image', destination: link.destination, alt: plainText(link.label) })
+        } else {
+          const children =
+            depth < MAX_DEPTH
+              ? parseInline(link.label, depth + 1)
+              : [{ type: 'text' as const, text: link.label }]
+          tokens.push({
+            type: 'link',
+            destination: link.destination,
+            attributes: link.attributes,
+            children: unwrapLinks(children),
+          })
+        }
+        index = link.end
+        continue
+      }
+    }
+
+    // Emphasis and strikethrough delimiter runs.
+    if (char === '*' || char === '_' || char === '~') {
+      const run = char.repeat(runLength(source, index, char))
+      const before = index > 0 ? source[index - 1] : undefined
+      const after = source[index + run.length]
+      const leftFlanking =
+        !isWhitespace(after) &&
+        (!isPunctuation(after) || isWhitespace(before) || isPunctuation(before))
+      const rightFlanking =
+        !isWhitespace(before) &&
+        (!isPunctuation(before) || isWhitespace(after) || isPunctuation(after))
+      let canOpen = leftFlanking
+      let canClose = rightFlanking
+      if (char === '_') {
+        canOpen = leftFlanking && (!rightFlanking || isPunctuation(before))
+        canClose = rightFlanking && (!leftFlanking || isPunctuation(after))
+      }
+      if (char === '~' && run.length !== 2) {
+        text += run
+        index += run.length
+        continue
+      }
+      flush()
+      tokens.push({ type: 'delimiter', char, count: run.length, canOpen, canClose })
+      index += run.length
+      continue
+    }
+
+    text += char
+    index += 1
+  }
+  flush()
+
+  return mergeText(processEmphasis(tokens))
+}
+
+/** Length of the run of `char` starting at `index` (no string copies, so linear overall). */
+function runLength(source: string, index: number, char: string): number {
+  let end = index
+  while (source[end] === char) end += 1
+  return end - index
+}
+
+/**
+ * Pairs every `[` with its `]` in one pass (skipping escapes and code spans), so looking up a
+ * link label is constant time instead of a scan per bracket.
+ */
+function matchBrackets(source: string): Map<number, number> {
+  const matches = new Map<number, number>()
+  const open: number[] = []
+  let index = 0
+  while (index < source.length) {
+    const char = source[index]
+    if (char === '\\') {
+      index += 2
+      continue
+    }
+    if (char === '`') {
+      const length = runLength(source, index, '`')
+      const close = findClosingBackticks(source, index + length, length)
+      index = close >= 0 ? close + length : index + length
+      continue
+    }
+    if (char === '[') open.push(index)
+    else if (char === ']' && open.length > 0) matches.set(open.pop()!, index)
+    index += 1
+  }
+  return matches
+}
+
+function findClosingBackticks(source: string, from: number, length: number): number {
+  let index = from
+  const limit = Math.min(source.length, from + MAX_CODE_SPAN)
+  while (index < limit) {
+    const next = source.indexOf('`', index)
+    if (next < 0 || next >= limit) return -1
+    const run = runLength(source, next, '`')
+    if (run === length) return next
+    index = next + run
+  }
+  return -1
+}
+
+interface ListNode {
+  token: Token
+  prev: ListNode | null
+  next: ListNode | null
+}
+
+/**
+ * Resolves emphasis delimiters into strong/em/del nodes (CommonMark "process emphasis", simplified).
+ * Tokens are kept in a linked list so wrapping a matched pair is constant time, and the backward
+ * search for an opener is bounded, so adversarial input cannot make parsing quadratic.
+ */
+function processEmphasis(tokens: Token[]): Inline[] {
+  let head: ListNode | null = null
+  let tail: ListNode | null = null
+  for (const token of tokens) {
+    const node: ListNode = { token, prev: tail, next: null }
+    if (tail) tail.next = node
+    else head = node
+    tail = node
+  }
+
+  let closerNode = head
+  while (closerNode) {
+    const closer = closerNode.token
+    if (closer.type !== 'delimiter' || !closer.canClose) {
+      closerNode = closerNode.next
+      continue
+    }
+
+    // Find the nearest matching opener, looking back a bounded number of nodes.
+    let found: ListNode | null = null
+    let candidate = closerNode.prev
+    for (let steps = 0; candidate && steps < MAX_OPENER_SEARCH; steps += 1) {
+      const token = candidate.token
+      if (
+        token.type === 'delimiter' &&
+        token.char === closer.char &&
+        token.canOpen &&
+        // CommonMark "rule of 3" for runs that can both open and close.
+        !(
+          closer.char !== '~' &&
+          (token.canClose || closer.canOpen) &&
+          (token.count + closer.count) % 3 === 0 &&
+          !(token.count % 3 === 0 && closer.count % 3 === 0)
+        )
+      ) {
+        found = candidate
+        break
+      }
+      candidate = candidate.prev
+    }
+    if (!found) {
+      closerNode = closerNode.next
+      continue
+    }
+    const openerNode = found
+    const opener = openerNode.token as Delimiter
+
+    const use = closer.char === '~' || (opener.count >= 2 && closer.count >= 2) ? 2 : 1
+    const children: Inline[] = []
+    for (let inner = openerNode.next; inner && inner !== closerNode; inner = inner.next) {
+      children.push(delimiterToText(inner.token))
+    }
+    const wrapped: ListNode = {
+      token: {
+        type: closer.char === '~' ? 'del' : use === 2 ? 'strong' : 'em',
+        children: mergeText(children),
+      },
+      prev: null,
+      next: null,
+    }
+    opener.count -= use
+    closer.count -= use
+
+    // Link: [opener if any left] wrapped [closer if any left]
+    const left: ListNode | null = opener.count > 0 ? openerNode : openerNode.prev
+    const right: ListNode | null = closer.count > 0 ? closerNode : closerNode.next
+    wrapped.prev = left
+    wrapped.next = right
+    if (left) left.next = wrapped
+    else head = wrapped
+    if (right) right.prev = wrapped
+
+    // Re-examine the closer if it has delimiters left; otherwise continue after the new node.
+    closerNode = right
+  }
+
+  const result: Inline[] = []
+  for (let node = head; node; node = node.next) result.push(delimiterToText(node.token))
   return result
 }
 
-/**
- * Transforms file links to clickable chat-source spans with data attributes
- */
-function transformSources(html: string): string {
-  // First, transform file links matching the pattern
-  const linkRegex = new RegExp(
-    `<a\\s+([^>]*?)href=["']([^"']*\/)?site\/([^/?#"']+)\/file\/([^?#"']+)(?:[?#][^"']*)?["']([^>]*?)>(.*?)</a>`,
-    'g',
-  )
+function delimiterToText(token: Token): Inline {
+  return token.type === 'delimiter' ? { type: 'text', text: token.char.repeat(token.count) } : token
+}
 
-  let transformed = html.replace(
-    linkRegex,
-    (match, attrsBefore, urlPrefix, siteId, fileIdWithQuery, attrsAfter, innerHTML) => {
-      return transformLinkToSource(attrsBefore, siteId, fileIdWithQuery, attrsAfter, innerHTML)
+function mergeText(nodes: Inline[]): Inline[] {
+  const merged: Inline[] = []
+  for (const node of nodes) {
+    const last = merged[merged.length - 1]
+    if (node.type === 'text' && last?.type === 'text') last.text += node.text
+    else if (node.type !== 'text' || node.text)
+      merged.push(node.type === 'text' ? { ...node } : node)
+  }
+  return merged
+}
+
+/** Links cannot contain links; keep the inner link's text. */
+function unwrapLinks(nodes: Inline[]): Inline[] {
+  return nodes.flatMap(node => {
+    if (node.type === 'link') return unwrapLinks(node.children)
+    if (node.type === 'strong' || node.type === 'em' || node.type === 'del') {
+      return [{ ...node, children: unwrapLinks(node.children) }]
+    }
+    return [node]
+  })
+}
+
+function plainText(markdown: string): string {
+  const parts: string[] = []
+  const walk = (nodes: Inline[]) => {
+    for (const node of nodes) {
+      if (node.type === 'text' || node.type === 'code') parts.push(node.text)
+      else if (node.type === 'image') parts.push(node.alt)
+      else if (node.type === 'break' || node.type === 'softbreak') parts.push(' ')
+      else if ('children' in node) walk(node.children)
+    }
+  }
+  walk(parseInline(markdown, MAX_DEPTH))
+  return parts.join('')
+}
+
+interface ParsedLink {
+  label: string
+  destination: string
+  attributes: Record<string, string>
+  end: number
+}
+
+/** Parses `[label](destination "title"){attributes}` starting at the `[`. */
+function parseLink(
+  source: string,
+  start: number,
+  brackets: Map<number, number>,
+): ParsedLink | null {
+  const labelEnd = brackets.get(start) ?? -1
+  if (labelEnd - start > MAX_LINK_LABEL) return null
+  if (labelEnd < 0 || source[labelEnd + 1] !== '(') return null
+
+  // Destination: <...> or a run without spaces and with balanced parentheses.
+  let index = labelEnd + 2
+  while (source[index] === ' ' || source[index] === '\n') index += 1
+  let destination = ''
+  if (source[index] === '<') {
+    const close = source.indexOf('>', index)
+    if (close < 0 || source.slice(index, close).includes('\n')) return null
+    destination = source.slice(index + 1, close)
+    index = close + 1
+  } else {
+    let parens = 0
+    const begin = index
+    while (index < source.length) {
+      const char = source[index]
+      if (char === '\\' && ASCII_PUNCTUATION.test(source[index + 1] ?? '')) {
+        index += 2
+        continue
+      }
+      if (/\s/.test(char)) break
+      if (char === '(') parens += 1
+      if (char === ')') {
+        if (parens === 0) break
+        parens -= 1
+      }
+      index += 1
+    }
+    destination = source.slice(begin, index).replace(/\\([!-/:-@[-`{-~])/g, '$1')
+  }
+
+  // Optional title.
+  while (source[index] === ' ' || source[index] === '\n') index += 1
+  const titleOpen = source[index]
+  if (titleOpen === '"' || titleOpen === "'" || titleOpen === '(') {
+    const titleClose = titleOpen === '(' ? ')' : titleOpen
+    const close = source.indexOf(titleClose, index + 1)
+    if (close < 0) return null
+    index = close + 1
+    while (source[index] === ' ' || source[index] === '\n') index += 1
+  }
+  if (source[index] !== ')') return null
+  index += 1
+
+  // Optional attribute block, for example {data-original-url="https://..."}.
+  let attributes: Record<string, string> = {}
+  const attributeBlock = /^[ \t]*\{([^}\n]*)\}/.exec(source.slice(index))
+  if (attributeBlock) {
+    const parsed = parseAttributes(attributeBlock[1])
+    if (parsed) {
+      attributes = parsed
+      index += attributeBlock[0].length
+    }
+  }
+
+  return {
+    label: source.slice(start + 1, labelEnd),
+    destination: decodeEntities(destination),
+    attributes,
+    end: index,
+  }
+}
+
+const QUOTES = `"'\u201c\u201d\u2018\u2019`
+
+/** Parses `name="value" other='value'`. Returns null if the block is not attributes. */
+function parseAttributes(block: string): Record<string, string> | null {
+  const attributes: Record<string, string> = {}
+  const pattern = new RegExp(
+    `([a-z][a-z0-9-]*)\\s*=\\s*[${QUOTES}]([^${QUOTES}]*)[${QUOTES}]`,
+    'gi',
+  )
+  let matched = false
+  for (const match of block.replace(/&quot;/g, '"').matchAll(pattern)) {
+    attributes[match[1].toLowerCase()] = decodeEntities(match[2])
+    matched = true
+  }
+  return matched ? attributes : null
+}
+
+/**
+ * `<WebSource data-url="...">Title</WebSource>`, or the malformed `<WebSource>https://...</WebSource>`.
+ * Returns a link, or no node when the tag carries no usable URL.
+ */
+function parseWebSource(
+  rest: string,
+  depth: number,
+): { node: Inline | null; length: number } | null {
+  const match = /^<websource\b([^>]*)>([\s\S]*?)<\/websource>/i.exec(rest)
+  if (!match) return null
+  const attributes = parseAttributes(match[1]) ?? {}
+  const body = match[2].trim()
+  const url = attributes['data-url'] ?? (/^https?:\/\//i.test(body) ? body : '')
+  if (!url) return { node: null, length: match[0].length }
+  const label = url === body || !body ? url : body
+  return {
+    node: {
+      type: 'link',
+      destination: url,
+      attributes: { 'data-url': url },
+      children:
+        depth < MAX_DEPTH
+          ? unwrapLinks(parseInline(label, depth + 1))
+          : [{ type: 'text', text: label }],
     },
-  )
-
-  // Also handle links with data-original-url or data-url that might not match the file pattern
-  // Add chat-source class to any <a> tag that has data-original-url
-  // Add web-source class to any <a> tag that has data-url (WebSource links)
-  // Updated regex to handle optional whitespace and ensure we capture all attributes
-  const dataUrlRegex = /<a(\s+[^>]*?)>/g
-  transformed = transformed.replace(dataUrlRegex, (match, attrs) => {
-    // Trim leading whitespace from attrs for easier processing
-    const attrsTrimmed = attrs.trim()
-
-    // Check if this link has data-url attribute (WebSource links)
-    if (attrsTrimmed.includes('data-url=') && !attrsTrimmed.includes('data-original-url=')) {
-      // Extract existing class if any (handle both quote types and various spacing)
-      const classMatch = attrsTrimmed.match(/class\s*=\s*["']([^"']*)["']/)
-
-      let newAttrs = attrs
-      let updatedClass = false
-
-      if (classMatch) {
-        // Check if web-source is already in the class list
-        const existingClasses = classMatch[1].trim()
-        if (!existingClasses.includes('web-source')) {
-          // Add web-source to existing classes, preserving the original quote style
-          const quote = classMatch[0].includes("'") ? "'" : '"'
-          newAttrs = newAttrs.replace(
-            /class\s*=\s*["']([^"']*)["']/,
-            `class=${quote}${existingClasses} web-source${quote}`,
-          )
-          updatedClass = true
-        }
-      } else {
-        // No class attribute exists, add one with web-source
-        newAttrs = `${newAttrs} class="web-source"`
-        updatedClass = true
-      }
-
-      // Ensure target and rel are set for external links
-      if (!attrsTrimmed.includes('target=')) {
-        newAttrs = `${newAttrs} target="_blank"`
-      }
-      if (!attrsTrimmed.includes('rel=')) {
-        newAttrs = `${newAttrs} rel="noopener noreferrer"`
-      }
-
-      return updatedClass || newAttrs !== attrs ? `<a${newAttrs}>` : match
-    }
-
-    // Check if this link has data-original-url attribute
-    if (attrsTrimmed.includes('data-original-url')) {
-      // Extract existing class if any (handle both quote types and various spacing)
-      const classMatch = attrsTrimmed.match(/class\s*=\s*["']([^"']*)["']/)
-
-      if (classMatch) {
-        // Check if chat-source is already in the class list
-        const existingClasses = classMatch[1].trim()
-        if (!existingClasses.includes('chat-source')) {
-          // Add chat-source to existing classes, preserving the original quote style
-          const quote = classMatch[0].includes("'") ? "'" : '"'
-          return match.replace(
-            /class\s*=\s*["']([^"']*)["']/,
-            `class=${quote}${existingClasses} chat-source${quote}`,
-          )
-        }
-        // If chat-source already exists, return unchanged
-      } else {
-        // No class attribute exists, add one with chat-source
-        return `<a${attrs} class="chat-source">`
-      }
-    }
-    return match
-  })
-
-  return transformed
-}
-
-function transformLinkToSource(
-  attrsBefore: string,
-  siteId: string,
-  fileIdWithQuery: string,
-  attrsAfter: string,
-  innerHTML: string,
-): string {
-  const fileId = fileIdWithQuery.split('?')[0].split('#')[0]
-  const linkText = innerHTML.trim()
-  const navigateParam = JSON.stringify({
-    id: fileId,
-    site: siteId,
-    kind: 'file',
-  })
-
-  const allAttrs = attrsBefore + ' ' + attrsAfter
-  const originalDataAttrs = extractDataAttributes(allAttrs)
-  const originalUrl = originalDataAttrs['data-original-url'] || ''
-  let tooltipText = linkText
-
-  if (originalUrl) {
-    try {
-      const urlObj = new URL(originalUrl)
-      tooltipText = urlObj.hostname.replace(/^www\./, '')
-    } catch {
-      tooltipText = linkText
-    }
-  }
-
-  const icon = 'fa-file'
-  const finalDataAttrs: Record<string, string> = {
-    'data-navigate-param': navigateParam,
-    'data-tippy-content': `<div class="source-chip"><div class="svg-icon"><svg><use xlink:href="/assets/sprites/sharp-light.svg#${icon}"></use></svg></div><div>${tooltipText}</div></div>`,
-  }
-
-  // Preserve data-original-url if it exists (for external links)
-  if (originalUrl) {
-    finalDataAttrs['data-original-url'] = originalUrl
-  }
-
-  const dataAttrsString = Object.entries(finalDataAttrs)
-    .map(([key, value]) => `${key}='${value}'`)
-    .join(' ')
-
-  return `<span class="chat-source" ${dataAttrsString}>${linkText}</span>`
-}
-
-/**
- * Post-processes rendered HTML to extract and attach attributes that appear after links
- * Markdown-it will convert [text](url){data-original-url="..."} to <a>text</a>{data-original-url="..."}
- * This function finds all <a> tags and checks if there are {attribute} blocks immediately after them,
- * then extracts and injects those attributes into the <a> tag.
- *
- * Pattern: <a>content</a>{data-original-url="..."} -> <a data-original-url="...">content</a>
- * Also handles multiple attributes: <a>content</a>{data-original-url="..." data-other="value"}
- */
-function postprocessLinkAttributes(html: string): string {
-  // Pattern to match: <a>content</a>{attributes...}
-  // Matches any <a> tag followed by optional whitespace and then { followed by attributes
-  // The attributes block can contain multiple attributes like {data-original-url="..." data-other="value"}
-  // Uses [\s\S]*? to match any content including newlines (non-greedy)
-  // (\s*) captures any whitespace between </a> and {, which we'll remove along with the {attributes} block
-  const pattern = /(<a\s+[^>]*>)([\s\S]*?)(<\/a>)(\s*)\{([^}]+)\}/g
-
-  const result = html.replace(
-    pattern,
-    (match, openTag, linkContent, closeTag, whitespace, attributesBlock) => {
-      // Decode HTML entities in the attributes block (e.g., &quot; -> ")
-      // This is necessary because markdown-it may escape quotes in the attributes block
-      const decodedBlock = attributesBlock
-        .replace(/&quot;/g, '"')
-        .replace(/&#34;/g, '"')
-        .replace(/&#x22;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/&#39;/g, "'")
-        .replace(/&#x27;/g, "'")
-        .replace(/&amp;/g, '&')
-
-      // Parse the attributes block: data-original-url="..." data-other="value"
-      // Extract all attribute=value pairs
-      // IMPORTANT: Handle both straight quotes ("') and curly quotes ("")
-      // Curly quotes: " (U+201C=8220) and " (U+201D=8221), ' (U+2018=8216) and ' (U+2019=8217)
-      // Pattern matches: attrName="value" or attrName='value' or attrName="value" etc.
-      // We capture the value between any quote type (straight or curly)
-      const attrPattern =
-        /(\w+(?:-\w+)*)=(["'\u201C\u201D\u2018\u2019])([^"'\u201C\u201D\u2018\u2019]+)(["'\u201C\u201D\u2018\u2019])/g
-      const attributes: Array<{ name: string; value: string }> = []
-      let attrMatch
-
-      // Reset regex lastIndex to ensure we start from the beginning
-      attrPattern.lastIndex = 0
-
-      while ((attrMatch = attrPattern.exec(decodedBlock)) !== null) {
-        const attrName = attrMatch[1]
-        const attrValue = attrMatch[3]
-
-        // Skip if the link already has this attribute
-        if (!openTag.includes(`${attrName}=`)) {
-          attributes.push({ name: attrName, value: attrValue })
-        }
-      }
-
-      // Inject all attributes into the opening tag
-      let newOpenTag = openTag
-      for (const attr of attributes) {
-        newOpenTag = newOpenTag.replace(/>$/, ` ${attr.name}="${attr.value}">`)
-      }
-
-      // Always return the cleaned link tag (with or without new attributes)
-      // This removes the trailing {attributes} block and whitespace, even if all attributes already existed
-      return newOpenTag + linkContent + closeTag
-    },
-  )
-
-  return result
-}
-
-/**
- * Decodes HTML entities in a string (e.g., &quot; -> ", &amp; -> &)
- * Uses a temporary DOM element to decode entities safely
- */
-function decodeHtmlEntities(text: string): string {
-  if (!text) return text
-  const textarea = document.createElement('textarea')
-  textarea.innerHTML = text
-  return textarea.value
-}
-
-/**
- * Escapes a string for safe use in HTML attribute values
- * Escapes: &, ", <, >
- */
-function escapeHtmlAttribute(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-}
-
-/**
- * Extracts the domain from a URL
- * @param url The URL to extract the domain from
- * @returns The domain (e.g., "example.com") or "source" if extraction fails
- */
-function extractDomainFromUrl(url: string): string {
-  try {
-    const urlObj = new URL(url)
-    return urlObj.hostname.replace(/^www\./, '') // Remove www. prefix if present
-  } catch {
-    // If URL parsing fails, try to extract domain manually
-    const match = url.match(/^(?:https?:\/\/)?(?:www\.)?([^\/]+)/i)
-    return match ? match[1] : 'source'
-  }
-}
-
-/**
- * Escapes a URL for safe use in markdown link targets.
- * URLs with parentheses, spaces, or other special characters need to be encoded
- * or wrapped in angle brackets to prevent markdown parsing errors.
- *
- * @param url The URL to escape
- * @returns Escaped URL safe for markdown link target
- */
-function escapeMarkdownUrl(url: string): string {
-  // Encode the URL to handle special characters like parentheses, spaces, etc.
-  // This ensures markdown parsers can correctly parse the link
-  try {
-    return encodeURI(url)
-  } catch {
-    // If encoding fails, return as-is (fallback)
-    return url
-  }
-}
-
-/**
- * Normalizes WebSource tags in text by converting them to markdown links with data-url attributes.
- * WebSource links use data-url (not data-original-url) to distinguish them from other source citations.
- * Handles both correct format (<WebSource data-url="url">Title</WebSource>) and HTML-escaped versions
- * (&lt;WebSource data-url=&quot;url&quot;&gt;Title&lt;/WebSource&gt;).
- *
- * @param text The text containing WebSource tags (may be HTML-escaped)
- * @returns Text with WebSource tags converted to markdown links
- */
-function normalizeWebSourceTags(text: string): string {
-  if (!text) return text
-
-  // First, decode HTML entities to handle escaped WebSource tags
-  // This converts &lt;WebSource&gt; back to <WebSource>
-  const decodedText = decodeHtmlEntities(text)
-  let processed = decodedText
-
-  // Process correct format: <WebSource data-url="url">Name</WebSource>
-  // Pattern matches: <WebSource data-url="...">text</WebSource> or <WebSource data-url='...'>text</WebSource>
-  // Capture optional character before tag to check if we need to add space
-  const webSourcePattern =
-    /(.)?<WebSource\s+data-url=["']([^"']+)["'][^>]*>([\s\S]*?)<\/WebSource>/gi
-  processed = processed.replace(webSourcePattern, (match, precedingChar, url, sourceName) => {
-    // Extract URL and source name
-    const cleanUrl = url.trim()
-    const cleanName = sourceName.trim() || extractDomainFromUrl(cleanUrl)
-
-    // Escape URL for markdown link target (handles special characters like parentheses, spaces, etc.)
-    const escapedMarkdownUrl = escapeMarkdownUrl(cleanUrl)
-    // Escape URL for safe use in HTML attribute value
-    const escapedAttributeUrl = escapeHtmlAttribute(cleanUrl)
-
-    // Ensure there's whitespace before the link to prevent markdown parsing issues
-    // (e.g., ![...] would be parsed as image, but ! [...] is safe)
-    // If precedingChar is undefined (start of string) or whitespace, no space needed
-    const needsSpace = precedingChar && !/\s/.test(precedingChar)
-    const spacePrefix = needsSpace ? ' ' : ''
-    const charPrefix = precedingChar || ''
-
-    // Create markdown link with data-url attribute (WebSource links use data-url, not data-original-url)
-    return `${charPrefix}${spacePrefix}[${cleanName}](${escapedMarkdownUrl}){data-url="${escapedAttributeUrl}"}`
-  })
-
-  // Fallback: Handle incorrect formats like <websource>url</websource> or <WebSource>url</WebSource>
-  // Try to extract URL and convert to proper format
-  // Capture optional character before tag to check if we need to add space
-  const incorrectWebSourcePattern = /(.)?<[Ww]eb[Ss]ource[^>]*>([\s\S]*?)<\/[Ww]eb[Ss]ource>/gi
-  processed = processed.replace(incorrectWebSourcePattern, (match, precedingChar, content) => {
-    // Skip if already processed by correct pattern (check if it has data-url attribute)
-    if (match.includes('data-url=')) {
-      return match // Already processed, skip
-    }
-    const trimmedContent = content.trim()
-    // Check if content looks like a URL
-    if (trimmedContent.match(/^https?:\/\//i)) {
-      // It's a URL, use domain as title
-      const domain = extractDomainFromUrl(trimmedContent)
-      const escapedMarkdownUrl = escapeMarkdownUrl(trimmedContent)
-      const escapedAttributeUrl = escapeHtmlAttribute(trimmedContent)
-      const needsSpace = precedingChar && !/\s/.test(precedingChar)
-      const spacePrefix = needsSpace ? ' ' : ''
-      const charPrefix = precedingChar || ''
-      return `${charPrefix}${spacePrefix}[${domain}](${escapedMarkdownUrl}){data-url="${escapedAttributeUrl}"}`
-    }
-    // If it doesn't look like a URL, try to find URL in attributes or skip
-    // Look for data-url attribute even in malformed tags
-    const urlMatch = match.match(/data-url=["']([^"']+)["']/i)
-    if (urlMatch) {
-      const url = urlMatch[1]
-      const domain = extractDomainFromUrl(url)
-      const escapedMarkdownUrl = escapeMarkdownUrl(url)
-      const escapedAttributeUrl = escapeHtmlAttribute(url)
-      const needsSpace = precedingChar && !/\s/.test(precedingChar)
-      const spacePrefix = needsSpace ? ' ' : ''
-      const charPrefix = precedingChar || ''
-      return `${charPrefix}${spacePrefix}[${domain}](${escapedMarkdownUrl}){data-url="${escapedAttributeUrl}"}`
-    }
-    // If we can't extract a URL, remove the tag but preserve preceding character
-    return precedingChar || ''
-  })
-
-  return processed
-}
-
-/**
- * Strip chunkId tags and their content from the text
- * This prevents chunkId markers from appearing in the rendered output
- */
-function stripChunkIdTags(content: string): string {
-  // Remove <chunkId>...</chunkId> tags (case-insensitive) and their content
-  // Uses [\s\S] instead of . to match newlines across multiple lines
-  // Also handles self-closing tags like <chunkId/>
-  return content
-    .replace(/<chunkid[^>]*>[\s\S]*?<\/chunkid>/gi, '')
-    .replace(/<chunkid[^>]*\/\s*>/gi, '')
-}
-
-/**
- * Format message content as markdown
- */
-export function formatMessage(content: string): string {
-  if (!content) return ''
-  try {
-    // Strip chunkId tags before processing to prevent their content from appearing
-    const cleanedContent = stripChunkIdTags(content)
-
-    // Normalize WebSource tags (convert <WebSource> tags to markdown links)
-    // This must happen before markdown-it processes the content
-    const contentWithNormalizedWebSources = normalizeWebSourceTags(cleanedContent)
-
-    // Render markdown - markdown-it will convert links but leave attributes as plain text after them
-    // Example: [text](url){data-original-url="..."} becomes <a>text</a>{data-original-url="..."}
-    const rendered = md.render(contentWithNormalizedWebSources)
-
-    // Post-process to extract attributes from {attribute} blocks after links and inject them into <a> tags
-    const postProcessed = postprocessLinkAttributes(rendered)
-
-    // Transform file links to chat-source spans and add chat-source class to links with data-original-url
-    const transformed = transformSources(postProcessed)
-
-    // Sanitize HTML
-    return DOMPurify.sanitize(transformed, {
-      ADD_TAGS: ['span'],
-      ADD_ATTR: [
-        'class',
-        'data-navigate-param',
-        'data-tippy-content',
-        'data-original-url',
-        'data-url',
-        'target',
-        'rel',
-      ],
-    })
-  } catch (error) {
-    console.error('[formatMessage] Error processing markdown:', error)
-    const cleanedContent = stripChunkIdTags(content)
-    return DOMPurify.sanitize(cleanedContent.replace(/\n/g, '<br>'))
+    length: match[0].length,
   }
 }

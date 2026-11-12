@@ -2,22 +2,27 @@
 import { computed } from 'vue'
 
 import { useWidgetI18n } from '../i18n/runtime'
-import { icons } from '../icons'
+import { getIconSVG } from '../icons'
 
 const props = withDefaults(
   defineProps<{
     isOpen: boolean
     widgetColor: string
     fabSize?: number
+    /** Side of the button the tooltip appears on (away from the screen edge). */
+    tooltipPlacement?: 'left' | 'right'
+    /** Whether the panel this button opens is open, and its element id (for screen readers). */
+    expanded?: boolean
+    controls?: string
   }>(),
   {
     fabSize: 56,
+    tooltipPlacement: 'left',
   },
 )
 
 const emit = defineEmits<{
   toggle: []
-  'fab-btn-ref': [element: HTMLElement | null]
 }>()
 const { t } = useWidgetI18n()
 
@@ -29,13 +34,6 @@ const iconSize = computed(() => {
   return props.isOpen ? Math.round(22 * scale) : Math.round(28 * scale)
 })
 
-// Helper function to wrap icon path in SVG tag
-function getIconSVG(iconName: keyof typeof icons, size: number = 16): string {
-  const iconPath = icons[iconName]
-  if (!iconPath) return ''
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" width="${size}" height="${size}" fill="currentColor">${iconPath}</svg>`
-}
-
 const fabStyle = computed(() => ({
   backgroundColor: props.widgetColor,
   width: `${props.fabSize}px`,
@@ -45,9 +43,13 @@ const fabStyle = computed(() => ({
 
 <template>
   <button
-    :ref="el => emit('fab-btn-ref', el as HTMLElement | null)"
+    type="button"
     class="ci-widget-fab"
     :aria-label="props.isOpen ? t('fab.closeChat') : t('fab.openChat')"
+    :aria-expanded="props.expanded ? 'true' : 'false'"
+    :aria-controls="props.expanded ? props.controls : undefined"
+    :data-tooltip="props.isOpen ? t('fab.closeChat') : t('fab.openChat')"
+    :data-tooltip-placement="props.tooltipPlacement"
     :style="fabStyle"
     @click="emit('toggle')"
   >
@@ -69,7 +71,7 @@ const fabStyle = computed(() => ({
   display: flex;
   align-items: center;
   justify-content: center;
-  color: white;
+  color: var(--ci-widget-on-accent);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.15);
   transition: all 0.2s ease;
 }
@@ -86,7 +88,7 @@ const fabStyle = computed(() => ({
 .ci-widget-fab .ci-widget-fab-icon {
   width: auto;
   height: auto;
-  color: white;
+  color: var(--ci-widget-on-accent);
 }
 
 .ci-widget-fab .ci-widget-fab-icon svg {

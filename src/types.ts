@@ -1,4 +1,4 @@
-import type { WidgetLocale } from './i18n/messages'
+import type { WidgetMessagesOption } from './i18n/types'
 
 // Inline type definitions for standalone widget
 
@@ -62,6 +62,8 @@ export interface PublicChatMessage {
 }
 
 export interface InitResponse {
+  /** Protocol version implemented by the server (docs/protocol). Missing means 1. */
+  protocolVersion?: number
   initialMessage: string
   style?: {
     color?: string
@@ -116,6 +118,11 @@ export interface WidgetProps {
   // User props for standalone usage
   userName?: string
   userEmail?: string
+  /**
+   * The site's ID for the signed-in visitor, sent to the server in x-clearideas-public-chat-user-id
+   * (protocol README §5.5) so it can attribute usage. Each user ID has its own conversations.
+   * Unverified: the page sets it, so servers must not grant access based on it.
+   */
   userId?: string
   // Note: Actions/links come only from server initData, not from props
   // Dark mode detection (allows parent page to communicate dark mode state)
@@ -130,13 +137,30 @@ export interface WidgetProps {
   // Can be a boolean, a function that returns boolean, or a string (global variable/function name)
   consentRequired?: boolean | (() => boolean) | string // If true, consent is required before using cookies/localStorage
   consentGranted?: boolean | (() => boolean) | string // If true, consent has been granted (only relevant if consentRequired is true)
-  locale?: WidgetLocale | string
+  /**
+   * Widget language as a BCP 47 tag (`fr`, `pt-BR`, `zh-TW`, …). Defaults to the page's
+   * `<html lang>`, or the browser's languages when the page has none. Unsupported languages fall
+   * back to English unless `messages` provides them.
+   */
+  locale?: string
+  /** Custom strings: extra locales or overrides of built-in strings (README "Languages"). */
+  messages?: WidgetMessagesOption
+  /**
+   * Milliseconds without any reply data (keep-alives included) after which a reply is abandoned
+   * with an error. Default 120000.
+   */
+  replyTimeoutMs?: number
 }
 
 export interface WidgetConfig extends WidgetProps {
   container?: string | HTMLElement
   hasConsent?: boolean | (() => boolean) | string // If string, it's a global variable/function name to check
   throwOnMissingConsent?: boolean // If true, throws an error when consent is not granted. Default: false (returns a no-op instance)
+  /**
+   * Render inside a shadow root (default true), isolating the widget from page styles and the page
+   * from widget styles. Set false only if the page must restyle the widget with its own CSS.
+   */
+  shadowDom?: boolean
 }
 
 export interface WidgetInstance {
@@ -144,6 +168,8 @@ export interface WidgetInstance {
   close: () => void
   toggle: () => void
   sendMessage: (content: string) => Promise<void>
+  /** Stops the reply in progress, keeping the text received so far. */
+  stopReply: () => void
   hide: () => void // Hide the floating action button
   show: () => void // Show the floating action button
   openChatDirectly: () => void // Open chat view directly, skipping home view
@@ -162,7 +188,9 @@ export interface WidgetInstance {
   setActions: (actions: WidgetAction[]) => void
   setUserName: (name: string | undefined) => void
   setUserEmail: (email: string | undefined) => void
-  setUserId: (id: string | undefined) => void
-  setLocale: (locale: WidgetLocale | string | undefined) => void
+  /** The signed-in user's ID; undefined, null or '' signs out. Changing it switches conversation. */
+  setUserId: (id: string | null | undefined) => void
+  setLocale: (locale: string | undefined) => void
+  setMessages: (messages: WidgetMessagesOption | undefined) => void
   destroy: () => void
 }

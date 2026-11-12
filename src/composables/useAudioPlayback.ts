@@ -16,19 +16,34 @@ export type MessageAudioState = {
   initSegmentReceived?: boolean // Flag to track if initialization segment has been appended
 }
 
+/** Decodes base64 audio from the server. Returns null for invalid data instead of throwing. */
+export function decodeBase64Audio(base64Audio: string): Uint8Array<ArrayBuffer> | null {
+  try {
+    return Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0))
+  } catch {
+    return null
+  }
+}
+
 export function useAudioPlayback() {
   // Per-message audio playback state
   const messageAudioState = ref<Map<number, MessageAudioState>>(new Map())
 
-  // Get or create audio element for a message
-  function getMessageAudio(messageIndex: number, base64Audio: string): HTMLAudioElement {
+  // Get or create the audio element for a message. Null when the audio data is invalid.
+  function getMessageAudio(messageIndex: number, base64Audio: string): HTMLAudioElement | null {
     const state = messageAudioState.value.get(messageIndex)
     if (state?.audio) {
       return state.audio
     }
 
+    const bytes = decodeBase64Audio(base64Audio)
+    if (!bytes) {
+      console.warn('[ClearIdeasWidget] Ignored invalid audio data from the server')
+      return null
+    }
+
     // Create new audio element (WebM/Opus format)
-    const audioBlob = new Blob([Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0))], {
+    const audioBlob = new Blob([bytes], {
       type: 'audio/webm; codecs="opus"',
     })
     const audioUrl = URL.createObjectURL(audioBlob)
@@ -82,10 +97,14 @@ export function useAudioPlayback() {
     stopAllAudio()
 
     const audio = getMessageAudio(messageIndex, base64Audio)
+    if (!audio) return
     const state = messageAudioState.value.get(messageIndex)
     if (state) {
       state.isPlaying = true
-      audio.play()
+      // Browsers may refuse playback without a user gesture (autoplay policy).
+      void audio.play()?.catch(() => {
+        state.isPlaying = false
+      })
     }
   }
 
