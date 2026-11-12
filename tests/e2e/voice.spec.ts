@@ -270,6 +270,9 @@ test.describe('voice in other languages, and accessibility', () => {
     await openChat(page, RECORDED_SITE)
     await startVoice(page)
     await expect(page.getByRole('button', { name: 'Send recording' })).toBeVisible()
+    // The previous voice view remains in the DOM during Vue's leave transition.
+    // Audit the settled recording UI, rather than its temporarily faded sibling.
+    await expect(voiceView(page)).toBeHidden()
     expect(await axeViolations(page)).toEqual([])
   })
 })

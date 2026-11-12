@@ -487,11 +487,12 @@ export function createChatApp(options: ChatAppOptions = {}): ChatApp {
           case 'test:disconnect':
             // Flush what was sent, then close the connection without terminating the body,
             // which the client sees as a network drop mid-stream.
+            // Yield an I/O turn so the client observes the preceding frames before FIN.
+            await new Promise<void>(resolve => setImmediate(resolve))
             await new Promise<void>(resolve => {
               if (res.socket) res.socket.end(resolve)
               else resolve()
             })
-            res.destroy()
             return
         }
         next = await events.next()
