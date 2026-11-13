@@ -1,6 +1,6 @@
 {
   "name": "@clearideas/chat",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.1",
   "description": "Standalone chat widget for the Clear Ideas\u00ae platform",
   "type": "module",
   "main": "./dist/clearideas-widget.cjs",
